@@ -45,6 +45,11 @@ class HashRing {
   // land on different machines.
   std::vector<std::string> owners(std::string_view key, std::size_t n) const;
 
+  // Same as owners(), but as positions in nodes(), written into `out` (which
+  // is cleared first). Allocation-free when `out` is reused: this is the
+  // proxy's per-request hot path.
+  void owner_positions(std::string_view key, std::size_t n, std::vector<std::uint32_t>& out) const;
+
   bool empty() const { return nodes_.empty(); }
   std::size_t node_count() const { return nodes_.size(); }
   const std::vector<std::string>& nodes() const { return nodes_; }

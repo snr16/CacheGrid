@@ -104,7 +104,8 @@ All tunables live in `config/`. There are no defaults hidden in code, and a miss
 | `config/proxy.conf` | Proxy settings: node list, virtual nodes, timeouts, client limits |
 | `config/local/*.conf` | Extra local nodes (include the base node config, override the port) |
 | `config/docker/*.conf` | Container variants (include the base configs, override addresses) |
-| `config/bench.conf` | Benchmark workloads |
+| `config/bench.conf` | Benchmark workloads and load-tester settings |
+| `config/bench/*.conf` | One file per benchmark scenario |
 | `config/test.conf` | Test-suite parameters |
 
 A file can start with `include <path>` and then override individual keys.
@@ -112,8 +113,24 @@ A file can start with `include <path>` and then override individual keys.
 ## Benchmarks
 
 ```bash
+benchmarks/fetch_trace.sh          # once: first 5M requests of a real Twitter cache trace (~214 MB)
+benchmarks/run_benchmarks.sh       # all scenarios; reports in benchmarks/raw/
 ./build/release/shard_contention config/bench.conf   # lock contention vs. shard count
 ./build/release/ring_analysis    config/bench.conf   # hash ring balance and key movement
 ```
 
-Results and methodology: `benchmarks/results.md`. Design decisions: `docs/architecture.md`.
+Highlights (single 8-core laptop; full results, setup and caveats in `benchmarks/results.md`):
+
+| Measure | Result |
+|---|---|
+| GET p95 at 100 concurrent requests (proxy + 3 nodes, 2 copies/key) | **1.6 ms** |
+| Highest concurrency with GET p95 < 5 ms (proxy + 3 nodes) | **~300** |
+| Peak throughput through the proxy (50k concurrency) | **~0.9–1.0M ops/s** |
+| Peak throughput, single node direct | **1.7M ops/s** |
+| Real Twitter trace replay, hit rate with 3 × 64 MB caches | **74–88%** |
+| Errors while a node is killed (`kill -9`) and restarted under load | **0** |
+| Proxy optimization from profiling (10k–50k concurrency) | **+49–57% throughput, −21–28% p95** |
+
+The trace replay uses the [Twitter cache-trace](https://github.com/twitter/cache-trace) dataset (cluster52), © Twitter, CC-BY 4.0.
+
+Design decisions: `docs/architecture.md`.

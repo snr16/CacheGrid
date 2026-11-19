@@ -38,6 +38,10 @@ add_library(cachegrid_core
   src/HashRing.cpp
   src/ProxyServer.cpp
   src/NodeClient.cpp
+  src/LatencyHistogram.cpp
+  src/Workload.cpp
+  src/LoadGenerator.cpp
+  src/ProcessStats.cpp
 )
 target_include_directories(cachegrid_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(cachegrid_core PUBLIC cachegrid_options Threads::Threads)
@@ -52,6 +56,8 @@ target_link_libraries(cachegrid-proxy PRIVATE cachegrid_core)
 # ---- Benchmarks -------------------------------------------------------------
 add_executable(shard_contention benchmarks/shard_contention.cpp)
 target_link_libraries(shard_contention PRIVATE cachegrid_core)
+add_executable(cachegrid-bench benchmarks/load_tester.cpp)
+target_link_libraries(cachegrid-bench PRIVATE cachegrid_core)
 add_executable(ring_analysis benchmarks/ring_analysis.cpp)
 target_link_libraries(ring_analysis PRIVATE cachegrid_core)
 
@@ -77,6 +83,7 @@ if(CACHEGRID_BUILD_TESTS)
     tests/HashRingTest.cpp
     tests/ProxyTest.cpp
     tests/NodeClientTest.cpp
+    tests/BenchToolsTest.cpp
   )
   target_link_libraries(cachegrid_tests PRIVATE cachegrid_core GTest::gtest_main)
   # Lets tests locate the shipped config files regardless of build directory.

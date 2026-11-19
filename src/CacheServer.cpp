@@ -15,6 +15,7 @@
 #include "cachegrid/Config.h"
 #include "cachegrid/Net.h"
 #include "cachegrid/Poller.h"
+#include "cachegrid/ProcessStats.h"
 #include "cachegrid/Resp.h"
 
 namespace cachegrid {
@@ -327,6 +328,8 @@ void CacheServer::append_info(std::string& out) const {
   out += "total_commands_processed:" + std::to_string(commands_.load()) + "\r\n";
   out += "protocol_errors:" + std::to_string(protocol_errors_.load()) + "\r\n";
   out += "worker_threads:" + std::to_string(opts_.net.worker_threads) + "\r\n";
+  out += "used_cpu_seconds:" + std::to_string(process_cpu_seconds()) + "\r\n";
+  out += "peak_rss_bytes:" + std::to_string(process_peak_rss_bytes()) + "\r\n";
 }
 
 }  // namespace cachegrid

@@ -28,6 +28,7 @@ so it can be defended in a design review.
 | D10 | Conflicts | **Last writer wins by version.** Version = proxy wall clock in µs << 8 \| `proxy.id`, never decreasing. Nodes apply `VSET`/`VDEL` only if the version is newer. Deletes leave **tombstones** (`cache.tombstone_ttl_ms`). | Order-independent: replays, retries and recovery copies can't overwrite newer data, and deletes can't be undone by stale copies. | With several proxies, clock skew decides near-simultaneous writes. Not linearizable. A tombstone evicted by LRU stops protecting its key. |
 | D11 | Rejoin / rebalance | **Recovery:** FLUSHALL the returning node (it may hold stale data), mark it *Recovering* (gets writes, not reads), wait `recovery_grace_ms` (≥ request timeout, so in-flight writes land), copy every key it owns from its peers via `SCAN` (versions and TTLs kept), then mark it Up. **Membership change:** fill every node with its keys, *then* trim keys it no longer owns. | A wiped-and-refilled node can never serve outdated values. Fill-before-trim never deletes a last copy. | Recovery time is proportional to data size. Between a fast restart and its detection (< one health interval), reads may miss on the restarted node. |
 | D13 | Ring hash | FNV-1a + Murmur3 finalizer, 160 virtual nodes per node, hashing the node **id** (not its address) | Deterministic on every platform (unlike `std::hash`), and different from the per-node shard hash. Ids keep keys in place if a node's address changes. | Not cryptographic, which doesn't matter for placement |
+| D14 | Proxy hot path | No per-request heap allocation besides the request buffer (precomputed node connections, index-based owner lookup, reused scratch buffers) | Profiling showed malloc/free plus allocator lock contention rivalling socket I/O | Slightly more bookkeeping when membership changes |
 | D12 | Configuration | Every tunable lives in `config/*.conf` (`key = value`), test parameters included (`config/test.conf`). There are **no defaults in code**: a missing key is a startup error that names the key. Files can `include` a base file and override keys. | All tuning is visible and reviewable in one place, with no hidden magic numbers. A typo can't silently fall back to a default. | Config files must list every key. A test checks that the shipped configs stay valid. |
 
 See the Phase 5 section for the write path, failover and recovery sequence.
@@ -119,3 +120,16 @@ health thread:  RUNID each node ─ fails×N ─► Down ─ answers again ─�
 **DBSIZE through the proxy** counts stored copies (keys × RF).
 
 **Measured on the live cluster:** see `benchmarks/results.md`. With node2 down: 3,000/3,000 reads and writes succeeded (Phase 4: 1,056 errors). After node2 recovered and node1 was stopped as well: 3,000/3,000 reads returned the newest value. Adding node4: 0 misses (Phase 4: 698), 6,000 copies (no stale copies left).
+
+## Phase 6 — Benchmarking & optimization
+
+**Load tester** (`cachegrid-bench`, engine in `src/LoadGenerator.cpp`):
+- N client threads, each with its own event loop over its share of connections. Every connection keeps exactly `depth` requests in flight (closed loop); **concurrency = connections × depth**.
+- Per-request latency = reply time − send time. Send times are queued per connection, since replies arrive in order. Latencies go into a log-linear histogram (`LatencyHistogram`, ~1.6% relative precision, O(1) record, merged across threads).
+- Only requests *sent* inside the measured window are counted, so warmup never leaks into results.
+- Workloads (`src/Workload.cpp`): uniform, Zipfian (YCSB/Gray algorithm), and trace replay (Twitter cache-trace CSV: get/gets → GET; set/add/replace/cas/append/prepend/incr/decr → SET at the recorded size and TTL; delete → DEL). Optional cache-aside refill (SET after a GET miss).
+- Server CPU and memory are read from each server's `INFO` (`used_cpu_seconds`, `peak_rss_bytes`, from `getrusage`) before and after every level.
+
+**Optimization (D14):** profiling showed the proxy spending about as much time in `malloc`/`free` (and waiting on the allocator's lock) as on socket I/O. The per-request path is now allocation-free apart from the request buffer: node connections are resolved once per membership change (`node_backend_`), owners come from `HashRing::owner_positions` into reused buffers, commands are compared case-insensitively without copying, and VSET/VDEL are encoded in place. Measured: +49–57% throughput and −21–28% p95 at 10k–50k concurrency (`benchmarks/results.md`).
+
+**Results summary:** p95 < 5 ms holds up to ~300 concurrent requests through the proxy (1.6 ms at 100); peak ~0.9–1.0M ops/s through the proxy and 1.7M ops/s on a node directly, on one 8-core laptop; 0 errors while a node is killed under load.

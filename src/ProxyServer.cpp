@@ -22,16 +22,21 @@
 #include "cachegrid/HashRing.h"
 #include "cachegrid/NodeClient.h"
 #include "cachegrid/Poller.h"
+#include "cachegrid/ProcessStats.h"
 #include "cachegrid/Resp.h"
 
 namespace cachegrid {
 
 namespace {
 
-std::string upper(const std::string& s) {
-  std::string u = s;
-  for (char& c : u) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  return u;
+// Case-insensitive equality with an upper-case literal, without allocating
+// (this runs for every command).
+bool is_cmd(const std::string& arg, std::string_view upper_name) {
+  if (arg.size() != upper_name.size()) return false;
+  for (std::size_t i = 0; i < arg.size(); ++i) {
+    if (std::toupper(static_cast<unsigned char>(arg[i])) != upper_name[i]) return false;
+  }
+  return true;
 }
 
 std::string arity_error(const std::string& cmd) {
@@ -162,14 +167,22 @@ struct ProxyServer::Membership {
       index.emplace(nodes[i].id, i);
       state[i].store(static_cast<int>(NodeState::Up));
     }
+    // The ring numbers nodes in sorted-id order; map that to our order.
+    for (const auto& id : ring.nodes()) ring_to_node.push_back(static_cast<std::uint32_t>(index.at(id)));
   }
 
   std::size_t owner(std::string_view key) const { return index.at(ring.owner(key)); }
 
+  // Hot path: owners as positions in `nodes`, written into a reused buffer.
+  void owners_into(std::string_view key, std::vector<std::uint32_t>& out) const {
+    ring.owner_positions(key, rf, out);
+    for (auto& p : out) p = ring_to_node[p];
+  }
+
   std::vector<std::size_t> owners(std::string_view key) const {
-    std::vector<std::size_t> out;
-    for (const auto& id : ring.owners(key, rf)) out.push_back(index.at(id));
-    return out;
+    std::vector<std::uint32_t> pos;
+    owners_into(key, pos);
+    return std::vector<std::size_t>(pos.begin(), pos.end());
   }
 
   bool owns(std::size_t node, std::string_view key) const {
@@ -184,6 +197,7 @@ struct ProxyServer::Membership {
   HashRing ring;
   std::size_t rf;
   std::unordered_map<std::string, std::size_t> index;  // node id -> position in `nodes`
+  std::vector<std::uint32_t> ring_to_node;             // ring position -> position in `nodes`
   // Health state per node. Written by the health thread, read by workers on
   // every request: atomics, no lock.
   std::unique_ptr<std::atomic<int>[]> state;
@@ -267,9 +281,8 @@ class ProxyServer::Worker {
     };
     std::vector<KeyResult> keys;  // Delete: one per key
 
-    std::vector<NodeAddress> candidates;  // Read: copies, best first
-    std::size_t next_candidate = 0;
-    std::string request;                  // Read: re-sent on failover
+    std::size_t next_candidate = 0;  // Read: which copy to try next on failover
+    std::string request;             // Read: re-sent on failover
   };
 
   struct Client {
@@ -306,6 +319,7 @@ class ProxyServer::Worker {
     TimePoint failed_at{};
     bool has_failed = false;
     bool watch_write = false;
+    bool dirty = false;  // queued for flushing in settle()
   };
 
   // ---- event dispatch ----
@@ -340,9 +354,12 @@ class ProxyServer::Worker {
         dirty_clients_.pop_back();
         settle_client(id);
       }
-      auto backends = std::move(dirty_backends_);
-      dirty_backends_.clear();
-      for (Backend* b : backends) flush_backend(*b);
+      flushing_.swap(dirty_backends_);
+      for (Backend* b : flushing_) {
+        b->dirty = false;
+        flush_backend(*b);
+      }
+      flushing_.clear();
     }
   }
 
@@ -452,67 +469,83 @@ class ProxyServer::Worker {
 
   void dispatch(std::uint64_t id, Client& c, const std::vector<std::string>& args) {
     refresh_membership();
-    const std::string cmd = upper(args[0]);
     const std::size_t argc = args.size();
+    const std::string& cmd = args[0];
 
-    if (cmd == "GET") {
+    if (is_cmd(cmd, "GET")) {
       if (argc != 2) {
         push_done(c, arity_error(cmd));
         return;
       }
+      m_->owners_into(args[1], owners_buf_);
+      read_order_into(owners_buf_, targets_buf_);
       Slot s;
       s.kind = Slot::Kind::Read;
-      s.candidates = read_order(m_->owners(args[1]));
       s.next_candidate = 1;
       s.request = resp::encode_command(args);
-      const NodeAddress first = s.candidates.front();
-      const std::string request = s.request;
       const std::uint64_t seq = push_slot(c, std::move(s));
-      forward(first, request, id, seq, 0);
-    } else if (cmd == "SET") {
+      forward(*targets_buf_.front(), c.slots.back().request, id, seq, 0);
+    } else if (is_cmd(cmd, "SET")) {
       if (argc != 3 && argc != 5) {
         push_done(c, arity_error(cmd));
         return;
       }
-      // VSET <version> key value [EX|PX n]
-      std::vector<std::string> v = {"VSET", std::to_string(proxy_.next_version())};
-      v.insert(v.end(), args.begin() + 1, args.end());
-      const auto owners = m_->owners(args[1]);
-      const auto targets = write_targets(owners);
+      // VSET <version> key value [EX|PX n], encoded straight into one buffer.
+      request_buf_.clear();
+      resp::write_array_header(request_buf_, argc + 1);
+      resp::write_bulk(request_buf_, "VSET");
+      resp::write_bulk(request_buf_, std::to_string(proxy_.next_version()));
+      for (std::size_t i = 1; i < argc; ++i) resp::write_bulk(request_buf_, args[i]);
+      m_->owners_into(args[1], owners_buf_);
+      write_targets_into(owners_buf_, targets_buf_);
       Slot s;
       s.kind = Slot::Kind::Write;
-      s.quorum = std::min(proxy_.opts_.write_quorum, owners.size());
-      s.remaining = targets.size();
+      s.quorum = std::min(proxy_.opts_.write_quorum, owners_buf_.size());
+      s.remaining = targets_buf_.size();
       const std::uint64_t seq = push_slot(c, std::move(s));
-      const std::string request = resp::encode_command(v);
-      for (const auto& node : targets) forward(node, request, id, seq, 0);
-    } else if (cmd == "DEL") {
+      for (Backend* b : targets_buf_) forward(*b, request_buf_, id, seq, 0);
+    } else if (is_cmd(cmd, "DEL")) {
       if (argc < 2) {
         push_done(c, arity_error(cmd));
         return;
       }
       const std::string version = std::to_string(proxy_.next_version());
-      std::vector<std::vector<NodeAddress>> targets;
+      // Pass 1: pick every key's targets (one snapshot of node states), so the
+      // slot knows exactly how many replies to expect before anything is sent.
+      std::vector<Backend*>& all_targets = failover_buf_;
+      all_targets.clear();
+      per_key_targets_.clear();
+      for (std::size_t i = 1; i < argc; ++i) {
+        m_->owners_into(args[i], owners_buf_);
+        write_targets_into(owners_buf_, targets_buf_);
+        all_targets.insert(all_targets.end(), targets_buf_.begin(), targets_buf_.end());
+        per_key_targets_.push_back(static_cast<std::uint32_t>(targets_buf_.size()));
+      }
       Slot s;
       s.kind = Slot::Kind::Delete;
       // A key can't have more copies than there are nodes.
       s.quorum = std::min({proxy_.opts_.write_quorum, m_->rf, m_->nodes.size()});
-      for (std::size_t i = 1; i < argc; ++i) {
-        targets.push_back(write_targets(m_->owners(args[i])));
-        s.remaining += targets.back().size();
-      }
+      s.remaining = all_targets.size();
       s.keys.resize(argc - 1);
       const std::uint64_t seq = push_slot(c, std::move(s));
+      // Pass 2: send. (Copy the target list: a synchronous failure reply can
+      // trigger a read failover elsewhere that reuses failover_buf_.)
+      const std::vector<Backend*> targets = all_targets;
+      std::size_t t = 0;
       for (std::size_t i = 1; i < argc; ++i) {
-        const std::string request = resp::encode_command({"VDEL", version, args[i]});
-        for (const auto& node : targets[i - 1]) {
-          forward(node, request, id, seq, static_cast<std::uint32_t>(i - 1));
+        request_buf_.clear();
+        resp::write_array_header(request_buf_, 3);
+        resp::write_bulk(request_buf_, "VDEL");
+        resp::write_bulk(request_buf_, version);
+        resp::write_bulk(request_buf_, args[i]);
+        for (std::uint32_t k = 0; k < per_key_targets_[i - 1]; ++k) {
+          forward(*targets[t++], request_buf_, id, seq, static_cast<std::uint32_t>(i - 1));
         }
       }
-    } else if (cmd == "DBSIZE") {
-      std::vector<NodeAddress> nodes;
+    } else if (is_cmd(cmd, "DBSIZE")) {
+      std::vector<Backend*> nodes;
       for (std::size_t n = 0; n < m_->nodes.size(); ++n) {
-        if (m_->state_of(n) != NodeState::Down) nodes.push_back(m_->nodes[n]);
+        if (m_->state_of(n) != NodeState::Down) nodes.push_back(node_backend_[n]);
       }
       if (nodes.empty()) {
         push_done(c, ":0\r\n");
@@ -523,8 +556,8 @@ class ProxyServer::Worker {
       s.remaining = nodes.size();
       const std::uint64_t seq = push_slot(c, std::move(s));
       const std::string req = resp::encode_command({"DBSIZE"});
-      for (const auto& node : nodes) forward(node, req, id, seq, 0);
-    } else if (cmd == "PING") {
+      for (Backend* b : nodes) forward(*b, req, id, seq, 0);
+    } else if (is_cmd(cmd, "PING")) {
       if (argc == 1) {
         push_done(c, "+PONG\r\n");
       } else if (argc == 2) {
@@ -534,16 +567,16 @@ class ProxyServer::Worker {
       } else {
         push_done(c, arity_error(cmd));
       }
-    } else if (cmd == "INFO") {
+    } else if (is_cmd(cmd, "INFO")) {
       std::string text;
       proxy_.append_info(text);
       std::string r;
       resp::write_bulk(r, text);
       push_done(c, r);
-    } else if (cmd == "QUIT") {
+    } else if (is_cmd(cmd, "QUIT")) {
       push_done(c, kOk);
       c.closing = true;
-    } else if (cmd == "COMMAND") {
+    } else if (is_cmd(cmd, "COMMAND")) {
       push_done(c, "*0\r\n");
     } else {
       push_done(c, "-ERR unknown command '" + args[0] + "'\r\n");
@@ -552,27 +585,25 @@ class ProxyServer::Worker {
 
   // Copies to read from, best first: Up, then Recovering (may lack data), then
   // Down (last resort: it may have come back before the health check noticed).
-  std::vector<NodeAddress> read_order(const std::vector<std::size_t>& owners) const {
-    std::vector<NodeAddress> out;
+  void read_order_into(const std::vector<std::uint32_t>& owners, std::vector<Backend*>& out) const {
+    out.clear();
     for (NodeState wanted : {NodeState::Up, NodeState::Recovering, NodeState::Down}) {
-      for (std::size_t n : owners) {
-        if (m_->state_of(n) == wanted) out.push_back(m_->nodes[n]);
+      for (std::uint32_t n : owners) {
+        if (m_->state_of(n) == wanted) out.push_back(node_backend_[n]);
       }
     }
-    return out;
   }
 
   // Copies to write to: every copy not known to be Down (a Down node is
   // refilled when it recovers). If all are Down, try them anyway.
-  std::vector<NodeAddress> write_targets(const std::vector<std::size_t>& owners) const {
-    std::vector<NodeAddress> out;
-    for (std::size_t n : owners) {
-      if (m_->state_of(n) != NodeState::Down) out.push_back(m_->nodes[n]);
+  void write_targets_into(const std::vector<std::uint32_t>& owners, std::vector<Backend*>& out) const {
+    out.clear();
+    for (std::uint32_t n : owners) {
+      if (m_->state_of(n) != NodeState::Down) out.push_back(node_backend_[n]);
     }
     if (out.empty()) {
-      for (std::size_t n : owners) out.push_back(m_->nodes[n]);
+      for (std::uint32_t n : owners) out.push_back(node_backend_[n]);
     }
-    return out;
   }
 
   std::uint64_t push_slot(Client& c, Slot s) {
@@ -620,13 +651,11 @@ class ProxyServer::Worker {
         if (!failed) {
           s.reply.assign(reply);
           s.done = true;
-        } else if (s.next_candidate < s.candidates.size()) {
+        } else if (Backend* next = failover_target(s)) {
           // Failover: try the next copy. (Nothing touches `s` after this
           // call, since forward() may deliver again synchronously.)
           proxy_.failovers_.fetch_add(1);
-          const NodeAddress next = s.candidates[s.next_candidate++];
-          const std::string request = s.request;
-          forward(next, request, client_id, seq, 0);
+          forward(*next, s.request, client_id, seq, 0);
         } else {
           s.reply.assign(reply);  // every copy failed
           s.done = true;
@@ -681,6 +710,17 @@ class ProxyServer::Worker {
     }
   }
 
+  // Next copy to try for a failed read, or nullptr. Rare path, so it simply
+  // recomputes the key's copies (the key is recovered from the stored request).
+  Backend* failover_target(Slot& s) {
+    resp::ParseResult r = resp::parse_command(s.request, limits_);
+    if (r.status != resp::ParseStatus::Ok || r.args.size() != 2) return nullptr;
+    m_->owners_into(r.args[1], owners_buf_);
+    read_order_into(owners_buf_, failover_buf_);
+    if (s.next_candidate >= failover_buf_.size()) return nullptr;
+    return failover_buf_[s.next_candidate++];
+  }
+
   bool flush_client(Client& c) {
     while (!c.out.empty()) {
       const ssize_t n = ::send(c.fd, c.out.data(), c.out.size(), net::kSendFlags);
@@ -715,6 +755,8 @@ class ProxyServer::Worker {
     if (v != m_version_ || !m_) {
       m_ = proxy_.membership();
       m_version_ = v;
+      node_backend_.clear();
+      for (const auto& addr : m_->nodes) node_backend_.push_back(&backend_for(addr));
     }
   }
 
@@ -727,9 +769,15 @@ class ProxyServer::Worker {
     return *slot;
   }
 
-  void forward(const NodeAddress& node, const std::string& request, std::uint64_t client_id, std::uint64_t seq,
+  void mark_dirty(Backend& b) {
+    if (!b.dirty) {
+      b.dirty = true;
+      dirty_backends_.push_back(&b);
+    }
+  }
+
+  void forward(Backend& b, std::string_view request, std::uint64_t client_id, std::uint64_t seq,
                std::uint32_t part) {
-    Backend& b = backend_for(node);
     const TimePoint now = Clock::now();
 
     if (b.state == Backend::State::Idle) {
@@ -749,7 +797,7 @@ class ProxyServer::Worker {
     proxy_.forwarded_.fetch_add(1);
     // Flushed in settle(): many commands queued in this round go out in one
     // send() call.
-    dirty_backends_.insert(&b);
+    mark_dirty(b);
   }
 
   bool connect(Backend& b, TimePoint now) {
@@ -781,7 +829,7 @@ class ProxyServer::Worker {
         return;
       }
       b.state = Backend::State::Connected;
-      dirty_backends_.insert(&b);
+      mark_dirty(b);
     }
     if (ev.readable) {
       ssize_t n;
@@ -800,7 +848,7 @@ class ProxyServer::Worker {
         }
       }
     }
-    if (ev.writable) dirty_backends_.insert(&b);
+    if (ev.writable) mark_dirty(b);
   }
 
   // Matches complete replies to pending requests, in order.
@@ -860,7 +908,6 @@ class ProxyServer::Worker {
     b.in.clear();
     b.out.clear();
     b.watch_write = false;
-    dirty_backends_.erase(&b);
     mark_failed(b, Clock::now());
 
     const std::string err = unavailable(b.addr);
@@ -897,7 +944,18 @@ class ProxyServer::Worker {
   std::unordered_map<int, Backend*> fd_backend_;
 
   std::vector<std::uint64_t> dirty_clients_;
-  std::unordered_set<Backend*> dirty_backends_;
+  std::vector<Backend*> dirty_backends_;  // each at most once (Backend::dirty)
+  std::vector<Backend*> flushing_;
+
+  // Per-membership: the connection for each node, so forwarding is a vector
+  // index instead of building an "id@host:port" string and hashing it.
+  std::vector<Backend*> node_backend_;
+  // Reused scratch buffers (no allocation per request once warmed up).
+  std::vector<std::uint32_t> owners_buf_;
+  std::vector<Backend*> targets_buf_;
+  std::vector<std::uint32_t> per_key_targets_;
+  std::vector<Backend*> failover_buf_;
+  std::string request_buf_;
 
   std::shared_ptr<const Membership> m_;
   std::uint64_t m_version_ = 0;
@@ -1032,6 +1090,8 @@ void ProxyServer::append_info(std::string& out) const {
   out += "read_failovers:" + std::to_string(failovers_.load()) + "\r\n";
   out += "protocol_errors:" + std::to_string(protocol_errors_.load()) + "\r\n";
   out += "worker_threads:" + std::to_string(opts_.net.worker_threads) + "\r\n";
+  out += "used_cpu_seconds:" + std::to_string(process_cpu_seconds()) + "\r\n";
+  out += "peak_rss_bytes:" + std::to_string(process_peak_rss_bytes()) + "\r\n";
   out += "# Replication\r\n";
   out += "replication_factor:" + std::to_string(opts_.replication_factor) + "\r\n";
   out += "write_quorum:" + std::to_string(opts_.write_quorum) + "\r\n";

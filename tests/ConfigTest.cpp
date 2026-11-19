@@ -1,6 +1,8 @@
 #include "cachegrid/Cache.h"
 #include "cachegrid/CacheServer.h"
 #include "cachegrid/Config.h"
+#include "cachegrid/LoadGenerator.h"
+#include "cachegrid/Workload.h"
 #include "cachegrid/ProxyServer.h"
 
 #include <gtest/gtest.h>
@@ -266,4 +268,23 @@ TEST(ProxyNodes, RejectsMalformedAndDuplicates) {
   }
   EXPECT_THROW(ProxyOptions::parse_nodes({"a@h:1", "a@h:2"}), ConfigError);
   EXPECT_THROW(ProxyOptions::parse_nodes({}), ConfigError);
+}
+
+TEST(ShippedConfig, EveryBenchmarkScenarioIsValid) {
+  const std::string dir = std::string(CACHEGRID_SOURCE_DIR) + "/config/bench";
+  std::size_t scenarios = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() != ".conf") continue;
+    ++scenarios;
+    const Config c = Config::load_file(entry.path().string());
+    const std::string name = entry.path().filename().string();
+    EXPECT_NO_THROW(load_options_from_config(c)) << name;
+    EXPECT_NO_THROW(c.get_string("bench.scenario.name")) << name;
+    EXPECT_NO_THROW(c.get_list("bench.load.concurrency_levels")) << name;
+    EXPECT_NO_THROW(c.get_bool("bench.workload.preload")) << name;
+    const std::string type = c.get_string("bench.workload.type");
+    EXPECT_TRUE(type == "uniform" || type == "zipf" || type == "trace") << name;
+    if (type != "trace") EXPECT_NO_THROW(make_workload_from_config(c)) << name;  // trace file is optional data
+  }
+  EXPECT_GE(scenarios, 7u);
 }

@@ -8,3 +8,9 @@ compile_commands.json
 # Personal learning notes (kept local)
 docs/learning/
 cachegrid.md
+
+# Downloaded datasets (large, third-party)
+data/
+
+# Benchmark server logs (regenerated each run)
+benchmarks/raw/logs/

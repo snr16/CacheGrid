@@ -69,19 +69,24 @@ const std::string& HashRing::owner(std::string_view key) const {
   return nodes_[it->second];
 }
 
-std::vector<std::string> HashRing::owners(std::string_view key, std::size_t n) const {
+void HashRing::owner_positions(std::string_view key, std::size_t n, std::vector<std::uint32_t>& out) const {
   if (ring_.empty()) throw std::logic_error("HashRing::owners on empty ring");
+  out.clear();
   const std::size_t want = std::min(n, nodes_.size());
-  std::vector<std::string> out;
-  std::vector<bool> taken(nodes_.size(), false);
   auto it = std::lower_bound(ring_.begin(), ring_.end(), std::make_pair(hash(key), std::uint32_t{0}));
   for (std::size_t steps = 0; out.size() < want && steps < ring_.size(); ++steps, ++it) {
     if (it == ring_.end()) it = ring_.begin();
-    if (!taken[it->second]) {
-      taken[it->second] = true;
-      out.push_back(nodes_[it->second]);
-    }
+    // `out` holds at most replication_factor entries, so a linear scan for
+    // "already chosen" is faster than any set.
+    if (std::find(out.begin(), out.end(), it->second) == out.end()) out.push_back(it->second);
   }
+}
+
+std::vector<std::string> HashRing::owners(std::string_view key, std::size_t n) const {
+  std::vector<std::uint32_t> pos;
+  owner_positions(key, n, pos);
+  std::vector<std::string> out;
+  for (std::uint32_t p : pos) out.push_back(nodes_[p]);
   return out;
 }
 
