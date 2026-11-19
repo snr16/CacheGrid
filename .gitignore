@@ -1,0 +1,10 @@
+build/
+.cache/
+compile_commands.json
+.DS_Store
+.vscode/
+.idea/
+
+# Personal learning notes (kept local)
+docs/learning/
+cachegrid.md
