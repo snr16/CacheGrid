@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "cachegrid/Cache.h"
+#include "cachegrid/Net.h"
 
 namespace cachegrid {
 
@@ -18,18 +19,8 @@ class Config;
 
 // All values come from the `server.*` keys in config/cachegrid.conf.
 struct ServerOptions {
-  std::string bind_address;       // IPv4 address to listen on
-  std::uint16_t port;             // 0 = let the OS pick a free port (tests)
-  std::size_t worker_threads;     // event-loop threads (the bounded pool)
-  std::size_t max_connections;    // beyond this, new clients get an error
-  int listen_backlog;             // kernel queue of not-yet-accepted connections
-  std::size_t max_request_bytes;  // largest single command
-  std::size_t max_args;           // most arguments in one command
-  std::size_t max_output_buffer;  // per client; exceeded = client disconnected
-  std::size_t read_chunk_bytes;   // bytes read per recv() call
-  std::size_t events_per_poll;    // most events handled per wake-up
-  Millis purge_interval;          // how often expired keys are swept
-  std::size_t fd_reserve;         // file descriptors kept for internal use
+  ListenerOptions net;    // port, threads, limits (shared with the proxy)
+  Millis purge_interval;  // how often expired keys are swept
 
   static ServerOptions from_config(const Config& cfg);
 };

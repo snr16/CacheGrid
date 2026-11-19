@@ -146,6 +146,66 @@ ParseResult parse_command(std::string_view buf, const Limits& limits) {
   return r;
 }
 
+namespace {
+
+ParseStatus frame_reply_inner(std::string_view buf, std::size_t max_bytes, std::size_t& consumed) {
+  // Iterative walk: `remaining` counts elements still expected. An array
+  // header adds its element count, so nested arrays need no recursion.
+  std::size_t pos = 0;
+  std::uint64_t remaining = 1;
+  while (remaining > 0) {
+    if (pos >= buf.size()) return ParseStatus::Incomplete;
+    const char type = buf[pos];
+    if (type == '+' || type == '-' || type == ':') {
+      const std::size_t end = buf.find(kCrlf, pos);
+      if (end == std::string_view::npos) return ParseStatus::Incomplete;
+      pos = end + kCrlf.size();
+      --remaining;
+      continue;
+    }
+    if (type != '$' && type != '*') return ParseStatus::Error;
+
+    std::int64_t n = 0;
+    std::size_t next = 0;
+    switch (read_int_line(buf, pos, n, next)) {
+      case LineStatus::Incomplete: return ParseStatus::Incomplete;
+      case LineStatus::Error: return ParseStatus::Error;
+      case LineStatus::Ok: break;
+    }
+    --remaining;
+    if (n < -1 || static_cast<std::int64_t>(max_bytes) < n) return ParseStatus::Error;
+    if (type == '*') {
+      if (n > 0) remaining += static_cast<std::uint64_t>(n);
+      pos = next;
+    } else if (n == -1) {
+      pos = next;  // null bulk string
+    } else {
+      const auto len = static_cast<std::size_t>(n);
+      if (buf.size() - next < len + kCrlf.size()) return ParseStatus::Incomplete;
+      if (buf.substr(next + len, kCrlf.size()) != kCrlf) return ParseStatus::Error;
+      pos = next + len + kCrlf.size();
+    }
+  }
+  consumed = pos;
+  return ParseStatus::Ok;
+}
+
+}  // namespace
+
+ParseStatus frame_reply(std::string_view buf, std::size_t max_bytes, std::size_t& consumed) {
+  const ParseStatus st = frame_reply_inner(buf, max_bytes, consumed);
+  if (st == ParseStatus::Ok && consumed > max_bytes) return ParseStatus::Error;
+  if (st == ParseStatus::Incomplete && buf.size() >= max_bytes) return ParseStatus::Error;
+  return st;
+}
+
+std::string encode_command(const std::vector<std::string>& args) {
+  std::string out;
+  write_array_header(out, args.size());
+  for (const auto& a : args) write_bulk(out, a);
+  return out;
+}
+
 void write_simple(std::string& out, std::string_view s) {
   out += '+';
   out += s;

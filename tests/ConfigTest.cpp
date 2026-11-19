@@ -1,9 +1,12 @@
 #include "cachegrid/Cache.h"
 #include "cachegrid/CacheServer.h"
 #include "cachegrid/Config.h"
+#include "cachegrid/ProxyServer.h"
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -157,4 +160,108 @@ TEST(ServerOptionsFromConfig, FdReserveMustCoverWorkers) {
   ASSERT_NE(pos, std::string::npos);
   text = text.substr(0, pos) + "server.fd_reserve = 4\n";
   EXPECT_THROW(ServerOptions::from_config(Config::parse(text)), ConfigError);
+}
+
+// ---- include / override ---------------------------------------------------------------
+
+namespace {
+// Writes files into a fresh temp directory for include tests.
+class TempDir {
+ public:
+  TempDir() {
+    char tmpl[] = "/tmp/cachegrid-config-test-XXXXXX";
+    path_ = ::mkdtemp(tmpl);
+  }
+  ~TempDir() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  std::string write(const std::string& name, const std::string& text) const {
+    const std::string p = path_ + "/" + name;
+    std::ofstream(p) << text;
+    return p;
+  }
+
+ private:
+  std::string path_;
+};
+}  // namespace
+
+TEST(ConfigInclude, IncludedValuesCanBeOverridden) {
+  TempDir d;
+  d.write("base.conf", "a = 1\nb = 2\n");
+  const Config c = Config::load_file(d.write("child.conf", "include base.conf\nb = 20\nc = 3\n"));
+  EXPECT_EQ(c.get_int("a"), 1);
+  EXPECT_EQ(c.get_int("b"), 20);
+  EXPECT_EQ(c.get_int("c"), 3);
+}
+
+TEST(ConfigInclude, DuplicateInSameFileStillRejected) {
+  TempDir d;
+  d.write("base.conf", "a = 1\n");
+  EXPECT_THROW(Config::load_file(d.write("child.conf", "include base.conf\nb = 1\nb = 2\n")), ConfigError);
+}
+
+TEST(ConfigInclude, IncludeAfterSettingsRejected) {
+  TempDir d;
+  d.write("base.conf", "a = 1\n");
+  EXPECT_THROW(Config::load_file(d.write("child.conf", "a = 5\ninclude base.conf\n")), ConfigError);
+}
+
+TEST(ConfigInclude, CycleRejected) {
+  TempDir d;
+  d.write("a.conf", "include b.conf\n");
+  d.write("b.conf", "include a.conf\n");
+  EXPECT_THROW(Config::load_file(d.write("start.conf", "include a.conf\n")), ConfigError);
+}
+
+TEST(ConfigInclude, MissingIncludeRejected) {
+  TempDir d;
+  EXPECT_THROW(Config::load_file(d.write("child.conf", "include nope.conf\n")), ConfigError);
+}
+
+// ---- Every shipped config must load ---------------------------------------------------
+
+TEST(ShippedConfig, LayeredNodeConfigsAreValid) {
+  for (const char* f : {"/config/local/node2.conf", "/config/local/node3.conf", "/config/docker/node.conf"}) {
+    const Config c = Config::load_file(std::string(CACHEGRID_SOURCE_DIR) + f);
+    EXPECT_NO_THROW(Cache::Options::from_config(c)) << f;
+    EXPECT_NO_THROW(ServerOptions::from_config(c)) << f;
+  }
+  EXPECT_EQ(Config::load_file(CACHEGRID_SOURCE_DIR "/config/local/node3.conf").get_size("server.port"), 7003u);
+  EXPECT_EQ(Config::load_file(CACHEGRID_SOURCE_DIR "/config/docker/node.conf").get_string("server.bind_address"),
+            "0.0.0.0");
+}
+
+TEST(ShippedConfig, ProxyConfigsAreValid) {
+  for (const char* f : {"/config/proxy.conf", "/config/docker/proxy.conf"}) {
+    const ProxyOptions o = ProxyOptions::from_config(Config::load_file(std::string(CACHEGRID_SOURCE_DIR) + f));
+    EXPECT_EQ(o.nodes.size(), 3u) << f;
+  }
+}
+
+TEST(ShippedConfig, RingBenchKeysPresent) {
+  const Config c = Config::load_file(CACHEGRID_SOURCE_DIR "/config/bench.conf");
+  EXPECT_NO_THROW(c.get_size("bench.ring.keys"));
+  EXPECT_NO_THROW(c.get_size("bench.ring.nodes"));
+  EXPECT_NO_THROW(c.get_size("bench.ring.change_vnodes"));
+  EXPECT_NO_THROW(c.get_list("bench.ring.vnode_counts"));
+}
+
+// ---- Proxy node list parsing -----------------------------------------------------------
+
+TEST(ProxyNodes, ParsesIdHostPort) {
+  const auto n = ProxyOptions::parse_nodes({"a@10.0.0.1:7001", "b@node-b:7002"});
+  ASSERT_EQ(n.size(), 2u);
+  EXPECT_EQ(n[1].id, "b");
+  EXPECT_EQ(n[1].host, "node-b");
+  EXPECT_EQ(n[1].port, 7002);
+}
+
+TEST(ProxyNodes, RejectsMalformedAndDuplicates) {
+  for (std::string bad : {"nohost", "a@host", "a@host:0", "a@host:99999", "@host:1", "a@:1", "a@host:12x"}) {
+    EXPECT_THROW(ProxyOptions::parse_nodes({bad}), ConfigError) << bad;
+  }
+  EXPECT_THROW(ProxyOptions::parse_nodes({"a@h:1", "a@h:2"}), ConfigError);
+  EXPECT_THROW(ProxyOptions::parse_nodes({}), ConfigError);
 }

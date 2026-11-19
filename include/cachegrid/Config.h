@@ -24,8 +24,19 @@ struct ConfigError : std::runtime_error {
 // key if it's missing or malformed. There are deliberately no fallback
 // defaults: every tunable must be written in the file, so it's visible and
 // reviewable in one place.
+//
+// Layering (files only):
+//
+//   include ../cachegrid.conf     # path relative to this file
+//   server.port = 7002            # overrides the included value
+//
+// Keys from an included file may be overridden by the including file; a key
+// set twice in the *same* file is still an error. Includes must come before
+// any settings in a file. Include cycles are an error.
 class Config {
  public:
+  // Parses text with no `include` support (there's no file to resolve paths
+  // against).
   static Config parse(const std::string& text, const std::string& source = "<string>");
   static Config load_file(const std::string& path);
 
@@ -42,6 +53,8 @@ class Config {
   std::vector<std::string> get_list(const std::string& key) const;
 
  private:
+  static void load_into(const std::string& path, Config& cfg, std::vector<std::string>& stack);
+
   [[noreturn]] void fail(const std::string& key, const std::string& why) const;
 
   std::string source_;

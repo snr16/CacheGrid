@@ -19,7 +19,8 @@ using Keys = std::list<std::string>;
 
 namespace {
 
-constexpr std::size_t kBig = 1 << 20;  // 1 MiB: large enough to never fill up
+// Capacity large enough that these tests never fill the cache.
+const std::size_t kBig = cfg_bytes("test.big_capacity");
 
 // Capacity that fits exactly n entries with 1-char key and 1-char value.
 std::size_t room_for(std::size_t n) { return n * cost("a", "v"); }
@@ -351,16 +352,19 @@ class ModelLru {
 }  // namespace
 
 TEST(CacheLru, MatchesReferenceModelOnRandomOperations) {
-  const std::size_t cap = 10 * cost("key00", std::string(20, 'x'));
+  // Room for ~10 typical entries, so eviction happens constantly.
+  const std::size_t max_len = cfg_size("test.model.max_value_len");
+  const std::size_t cap = 10 * cost("key00", std::string(max_len / 2, 'x'));
   LRUCache real(lru_opts(cap));
   ModelLru model(cap);
 
-  std::mt19937 rng(42);  // fixed seed: failures are reproducible
-  std::uniform_int_distribution<int> key_dist(0, 24);
+  std::mt19937 rng(static_cast<unsigned>(cfg_size("test.random_seed")));  // fixed: reproducible
+  std::uniform_int_distribution<int> key_dist(0, cfg_int("test.model.key_space") - 1);
   std::uniform_int_distribution<int> op_dist(0, 9);
-  std::uniform_int_distribution<std::size_t> len_dist(0, 40);
+  std::uniform_int_distribution<std::size_t> len_dist(0, max_len);
 
-  for (int step = 0; step < 20000; ++step) {
+  const int steps = cfg_int("test.model.steps");
+  for (int step = 0; step < steps; ++step) {
     const std::string key = "key" + std::to_string(key_dist(rng));
     const int op = op_dist(rng);
     if (op < 5) {

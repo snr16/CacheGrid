@@ -1,4 +1,5 @@
 #include "cachegrid/Resp.h"
+#include "TestUtil.h"
 
 #include <gtest/gtest.h>
 
@@ -7,8 +8,9 @@ using Args = std::vector<std::string>;
 
 namespace {
 
-// Test fixture limits (independent of shipped config).
-const Limits kLimits{1024, 16};
+// Small limits (config/test.conf) so over-limit cases are cheap to build.
+const Limits kLimits{cachegrid::test::cfg_bytes("test.resp.max_request_bytes"),
+                     cachegrid::test::cfg_size("test.resp.max_args")};
 
 ParseResult parse(std::string_view s) { return parse_command(s, kLimits); }
 
@@ -112,19 +114,21 @@ TEST(RespParse, LengthLineTooLongWithoutCrlf) {
 }
 
 TEST(RespParse, TooManyArguments) {
-  EXPECT_EQ(parse("*17\r\n").status, ParseStatus::Error);
+  const std::size_t too_many = kLimits.max_args + 1;
+  EXPECT_EQ(parse("*" + std::to_string(too_many) + "\r\n").status, ParseStatus::Error);
   std::string inline_cmd;
-  for (int i = 0; i < 17; ++i) inline_cmd += "a ";
+  for (std::size_t i = 0; i < too_many; ++i) inline_cmd += "a ";
   EXPECT_EQ(parse(inline_cmd + "\n").status, ParseStatus::Error);
 }
 
 TEST(RespParse, BulkLongerThanRequestLimit) {
-  EXPECT_EQ(parse("*1\r\n$2000\r\n").status, ParseStatus::Error);
+  const std::string len = std::to_string(kLimits.max_request_bytes + 1);
+  EXPECT_EQ(parse("*1\r\n$" + len + "\r\n").status, ParseStatus::Error);
 }
 
 TEST(RespParse, IncompleteRequestOverLimitIsError) {
   // A client streaming an endless line must not grow our buffer forever.
-  EXPECT_EQ(parse(std::string(1024, 'a')).status, ParseStatus::Error);
+  EXPECT_EQ(parse(std::string(kLimits.max_request_bytes, 'a')).status, ParseStatus::Error);
 }
 
 // ---- Encoding replies ----------------------------------------------------------------
@@ -138,4 +142,47 @@ TEST(RespWrite, AllReplyTypes) {
   write_null(out);
   write_array_header(out, 0);
   EXPECT_EQ(out, "+OK\r\n-ERR bad\r\n:-3\r\n$2\r\nhi\r\n$-1\r\n*0\r\n");
+}
+
+// ---- Framing replies (used by the proxy) -----------------------------------------------
+
+namespace {
+ParseStatus frame(std::string_view s, std::size_t& len) { return frame_reply(s, kLimits.max_request_bytes, len); }
+}  // namespace
+
+TEST(RespFrameReply, AllReplyTypes) {
+  for (std::string r : {"+OK\r\n", "-ERR x\r\n", ":42\r\n", "$5\r\nhello\r\n", "$-1\r\n", "*0\r\n",
+                        "*2\r\n$1\r\na\r\n:1\r\n", "*1\r\n*1\r\n+nested\r\n"}) {
+    std::size_t len = 0;
+    ASSERT_EQ(frame(r + "+NEXT\r\n", len), ParseStatus::Ok) << r;
+    EXPECT_EQ(len, r.size()) << r;
+  }
+}
+
+TEST(RespFrameReply, EveryPrefixIsIncomplete) {
+  const std::string r = "*2\r\n$5\r\nhello\r\n:7\r\n";
+  for (std::size_t n = 0; n < r.size(); ++n) {
+    std::size_t len = 0;
+    EXPECT_EQ(frame(r.substr(0, n), len), ParseStatus::Incomplete) << "prefix " << n;
+  }
+}
+
+TEST(RespFrameReply, BinaryBulkWithCrlfInside) {
+  const std::string r = "$4\r\na\r\nb\r\n";
+  std::size_t len = 0;
+  ASSERT_EQ(frame(r, len), ParseStatus::Ok);
+  EXPECT_EQ(len, r.size());
+}
+
+TEST(RespFrameReply, RejectsGarbageAndOversize) {
+  std::size_t len = 0;
+  EXPECT_EQ(frame("?what\r\n", len), ParseStatus::Error);
+  EXPECT_EQ(frame("$-5\r\n", len), ParseStatus::Error);
+  EXPECT_EQ(frame("$" + std::to_string(kLimits.max_request_bytes + 1) + "\r\n", len), ParseStatus::Error);
+  EXPECT_EQ(frame("$3\r\nabcXY", len), ParseStatus::Error);
+  EXPECT_EQ(frame(std::string(kLimits.max_request_bytes, '+'), len), ParseStatus::Error);
+}
+
+TEST(RespEncode, CommandAsBulkArray) {
+  EXPECT_EQ(encode_command({"SET", "k", ""}), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n");
 }

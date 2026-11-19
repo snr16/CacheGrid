@@ -1,6 +1,9 @@
 #include "cachegrid/Config.h"
 
+#include <climits>
 #include <cctype>
+#include <cstdlib>
+#include <set>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -60,11 +63,53 @@ Config Config::parse(const std::string& text, const std::string& source) {
 }
 
 Config Config::load_file(const std::string& path) {
-  std::ifstream f(path);
+  Config cfg;
+  cfg.source_ = path;
+  std::vector<std::string> stack;
+  load_into(path, cfg, stack);
+  return cfg;
+}
+
+void Config::load_into(const std::string& path, Config& cfg, std::vector<std::string>& stack) {
+  char resolved[PATH_MAX];
+  if (::realpath(path.c_str(), resolved) == nullptr) {
+    throw ConfigError("cannot open config file '" + path + "'");
+  }
+  const std::string canonical = resolved;
+  for (const auto& p : stack) {
+    if (p == canonical) throw ConfigError("config include cycle at '" + path + "'");
+  }
+  std::ifstream f(canonical);
   if (!f) throw ConfigError("cannot open config file '" + path + "'");
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return parse(ss.str(), path);
+  stack.push_back(canonical);
+
+  const std::string dir = canonical.substr(0, canonical.rfind('/') + 1);
+  std::set<std::string> set_here;  // keys assigned by this file itself
+  std::string line;
+  int line_no = 0;
+  while (std::getline(f, line)) {
+    ++line_no;
+    const std::string t = trim(line);
+    if (t.empty() || t[0] == '#') continue;
+    const std::string where = path + ":" + std::to_string(line_no);
+
+    if (t.rfind("include ", 0) == 0) {
+      const std::string target = trim(t.substr(8));
+      if (target.empty()) throw ConfigError(where + ": include needs a file path");
+      // Otherwise the included file would silently override settings above it.
+      if (!set_here.empty()) throw ConfigError(where + ": include must come before any settings");
+      load_into(target[0] == '/' ? target : dir + target, cfg, stack);
+      continue;
+    }
+
+    const auto eq = t.find('=');
+    if (eq == std::string::npos) throw ConfigError(where + ": expected 'key = value'");
+    const std::string key = trim(t.substr(0, eq));
+    if (key.empty()) throw ConfigError(where + ": empty key");
+    if (!set_here.insert(key).second) throw ConfigError(where + ": duplicate key '" + key + "'");
+    cfg.values_[key] = trim(t.substr(eq + 1));  // may override an included value
+  }
+  stack.pop_back();
 }
 
 void Config::fail(const std::string& key, const std::string& why) const {

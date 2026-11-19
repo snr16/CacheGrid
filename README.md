@@ -2,6 +2,12 @@
 
 A distributed in-memory key-value cache in C++17, with consistent hashing, LRU eviction, replication and a RESP-compatible TCP interface.
 
+```text
+clients ──RESP──► cachegrid-proxy ──► node1 ┐
+                  (consistent hash   ► node2 ├ cachegrid-server (sharded LRU + TTL)
+                   with vnodes)      ► node3 ┘
+```
+
 ## Build & test
 
 ```bash
@@ -13,7 +19,35 @@ cmake --preset tsan  && cmake --build --preset tsan  -j && ctest --preset tsan
 
 Requires CMake ≥ 3.20 and a C++17 compiler. GoogleTest is downloaded automatically during the CMake configure step.
 
-## Running a node
+## Running a cluster (Docker Compose)
+
+```bash
+docker compose up --build -d     # builds the image (running all tests on Linux) and starts 3 nodes + proxy
+printf 'SET user:1 alice\r\nGET user:1\r\nDBSIZE\r\nQUIT\r\n' | nc 127.0.0.1 7100
+docker compose down
+```
+
+Clients connect to the proxy on **port 7100**. Nodes are also published on 7001–7003 for inspection.
+
+**Changing membership without a restart:**
+```bash
+docker compose --profile scale up -d node4
+# add node4@node4:7001 to proxy.nodes in config/docker/proxy.conf, then:
+docker compose kill -s HUP proxy
+```
+Only the keys that now belong to node4 move (~1/4); see `benchmarks/results.md`.
+
+## Running locally without Docker
+
+```bash
+cmake --preset release && cmake --build --preset release -j
+./build/release/cachegrid-server config/cachegrid.conf      # node1 :7001
+./build/release/cachegrid-server config/local/node2.conf    # node2 :7002
+./build/release/cachegrid-server config/local/node3.conf    # node3 :7003
+./build/release/cachegrid-proxy  config/proxy.conf          # proxy :7100
+```
+
+## Running a single node
 
 ```bash
 cmake --preset release && cmake --build --preset release -j
@@ -34,19 +68,10 @@ alice
 | `PING [msg]` | `PONG` or `msg` |
 | `SET key value [EX seconds \| PX milliseconds]` | `OK` |
 | `GET key` | value, or null if missing/expired |
-| `DEL key [key ...]` | number of keys removed |
-| `DBSIZE` | number of keys |
-| `INFO` | connection, hit/miss, eviction and memory stats |
+| `DEL key [key ...]` | number of keys removed (via the proxy: keys may span nodes) |
+| `DBSIZE` | number of keys (via the proxy: summed over all nodes) |
+| `INFO` | connection, hit/miss, eviction and memory stats (proxy: routing stats and node list) |
 | `QUIT` | `OK`, then the connection closes |
-
-### Docker
-
-```bash
-docker build -t cachegrid .        # also runs the full test suite on Linux
-docker run --rm -p 7001:7001 -v "$PWD/my-config:/etc/cachegrid:ro" cachegrid
-```
-
-The mounted `cachegrid.conf` must set `server.bind_address = 0.0.0.0` for the port to be reachable from outside the container.
 
 ## Configuration
 
@@ -55,12 +80,19 @@ All tunables live in `config/`. There are no defaults hidden in code, and a miss
 | File | Purpose |
 |---|---|
 | `config/cachegrid.conf` | Node settings: cache capacity, shards, eviction policy, network limits, threads |
+| `config/proxy.conf` | Proxy settings: node list, virtual nodes, timeouts, client limits |
+| `config/local/*.conf` | Extra local nodes (include the base node config, override the port) |
+| `config/docker/*.conf` | Container variants (include the base configs, override addresses) |
 | `config/bench.conf` | Benchmark workloads |
+| `config/test.conf` | Test-suite parameters |
+
+A file can start with `include <path>` and then override individual keys.
 
 ## Benchmarks
 
 ```bash
-./build/release/shard_contention config/bench.conf
+./build/release/shard_contention config/bench.conf   # lock contention vs. shard count
+./build/release/ring_analysis    config/bench.conf   # hash ring balance and key movement
 ```
 
 Results and methodology: `benchmarks/results.md`. Design decisions: `docs/architecture.md`.

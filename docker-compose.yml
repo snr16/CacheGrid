@@ -1,0 +1,48 @@
+# CacheGrid cluster: 3 cache nodes behind one proxy.
+#
+#   docker compose up --build -d        # build (runs all tests on Linux) and start
+#   printf 'SET a 1\r\nGET a\r\nQUIT\r\n' | nc 127.0.0.1 7100
+#   docker compose down
+#
+# Clients talk to the proxy on port 7100. Nodes are also published on
+# 7001-7003 so you can inspect them directly (e.g. DBSIZE on each).
+#
+# Settings come from ./config (mounted read-only, so edits apply on restart,
+# or for the proxy's node list, on `docker compose kill -s HUP proxy`).
+# Set CACHEGRID_CONFIG_DIR to use a different config directory.
+#
+# Adding a 4th node:
+#   docker compose --profile scale up -d node4
+#   add node4@node4:7001 to proxy.nodes in config/docker/proxy.conf
+#   docker compose kill -s HUP proxy
+
+x-node: &node
+  image: cachegrid:latest
+  pull_policy: never   # built locally by node1 below, never pulled
+  command: ["cachegrid-server", "/etc/cachegrid/docker/node.conf"]
+  volumes:
+    - ${CACHEGRID_CONFIG_DIR:-./config}:/etc/cachegrid:ro
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node
+    build: .           # the one service that builds the shared image
+    pull_policy: build
+    ports: ["7001:7001"]
+  node2:
+    <<: *node
+    ports: ["7002:7001"]
+  node3:
+    <<: *node
+    ports: ["7003:7001"]
+  node4:
+    <<: *node
+    ports: ["7004:7001"]
+    profiles: ["scale"]
+
+  proxy:
+    <<: *node
+    command: ["cachegrid-proxy", "/etc/cachegrid/docker/proxy.conf"]
+    ports: ["7100:7100"]
+    depends_on: [node1, node2, node3]

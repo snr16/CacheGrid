@@ -16,18 +16,19 @@ so it can be defended in a design review.
 
 | # | Topic | Decision | Why | Tradeoff |
 |---|---|---|---|---|
-| D1 | Routing | Small **proxy layer** holds the hash ring and routes requests | Clients stay simple (any RESP client, incl. `redis-cli`, works). Membership changes in one place. | Extra network hop, and the proxy can become a bottleneck or single point of failure. Mitigation: it's stateless, so several can run behind DNS or a load balancer. |
+| D1 | Routing | Small **proxy layer** holds the hash ring and routes requests. It's fully asynchronous: one pipelined connection per node per worker, plus per-client ordered reply slots. | Clients stay simple (any RESP client works). Membership changes in one place. | Extra network hop, and the proxy can become a bottleneck or single point of failure. Mitigation: it's stateless, so several can run behind DNS or a load balancer. |
 | D2 | Wire protocol | Subset of **RESP2** (Redis protocol) | Length-prefixed, so values can hold any bytes. Supports pipelining. Easy to debug with standard tools. | More parsing work than a newline-delimited text protocol. |
 | D3 | Capacity unit | **Bytes** (key + value + configured per-entry overhead, 96B) | Realistic memory budget. Entry count lets a few huge values blow past it. | The overhead constant is approximate. |
 | D4 | Expiration | **Lazy** on access + periodic **sweep** | Lazy is O(1) and accurate. The sweep reclaims memory from keys nobody reads again. | Sweep is O(n) today. It can switch to Redis-style random sampling if it shows up in profiles. |
 | D5 | Full-cache policy | Phase 1: `noeviction` (reject). Phase 2+: **LRU** | Build in small steps that can each be tested | — |
 | D6 | Concurrency | **Striped/sharded** LRU, one mutex per shard, 64 shards | Every LRU GET reorders the list, so it's a write and a reader-writer lock doesn't help. Measured: 64 shards ≈ 4× single-lock throughput on 8 threads. | LRU is per shard rather than global, so it's approximate. Max entry size = capacity / shards. |
 | D7 | I/O model | N worker threads, each with its own non-blocking event loop (kqueue on macOS, epoll on Linux), all sharing the listening socket. Commands run inline on the worker. | Thousands of connections on a few threads. A cache op takes under a microsecond, so handing it to a separate pool would cost more than the op itself (same model as Memcached). | Harder to write than blocking I/O. A slow command would stall the other clients on that worker, but every command here is O(1). |
-| D8 | Membership | **Static config** + health checks (no gossip/consensus) | Fits the scope. Failure detection without a consensus protocol. | Adding a node means a config change (proxy reload) |
+| D8 | Membership | **Static config** (`proxy.nodes`), reloaded live on **SIGHUP**. Health checks come in Phase 5. No gossip or consensus. | Fits the scope. One place to change, and a bad edit is rejected while the old membership stays active. | Each proxy must be told separately. No automatic node discovery. |
 | D9 | Replication | **Primary-backup**, RF=2. Primary writes the replica **synchronously** before acking. | A single node failure loses no acknowledged write | Write latency ≈ 2 hops |
 | D10 | Conflicts | **Per-key version**, highest version wins | Simple, and works for a cache | Not linearizable during failover |
 | D11 | Rejoin | A returning node starts **empty** and pulls the keys it owns from replicas before serving | It's a cache, and stale memory is worse than none | Rejoin takes time proportional to the amount of data |
-| D12 | Configuration | Every tunable lives in `config/*.conf` (`key = value`). There are **no defaults in code**: a missing key is a startup error that names the key. | All tuning is visible and reviewable in one place, with no hidden magic numbers. A typo can't silently fall back to a default. | Config files must list every key. A test checks that the shipped configs stay valid. |
+| D13 | Ring hash | FNV-1a + Murmur3 finalizer, 160 virtual nodes per node, hashing the node **id** (not its address) | Deterministic on every platform (unlike `std::hash`), and different from the per-node shard hash. Ids keep keys in place if a node's address changes. | Not cryptographic, which doesn't matter for placement |
+| D12 | Configuration | Every tunable lives in `config/*.conf` (`key = value`), test parameters included (`config/test.conf`). There are **no defaults in code**: a missing key is a startup error that names the key. Files can `include` a base file and override keys. | All tuning is visible and reviewable in one place, with no hidden magic numbers. A typo can't silently fall back to a default. | Config files must list every key. A test checks that the shipped configs stay valid. |
 
 Phase 5 will add a detailed write-path and failover sequence for D9–D11.
 
@@ -71,3 +72,24 @@ Phase 5 will add a detailed write-path and failover sequence for D9–D11.
 - **Shutdown:** SIGINT/SIGTERM are handled with `sigwait` on the main thread (no async signal-handler code). Each worker is woken through its pipe, connections are closed and threads joined.
 - **Open-file limit:** at startup the server raises its file-descriptor limit to `max_connections + fd_reserve`, or refuses to start. Hitting that limit at runtime would make `accept()` fail in a busy loop.
 - **Portability:** the same test suite runs on macOS (kqueue, clang) and Linux (epoll, gcc) via the Dockerfile.
+
+## Phase 4 — Proxy & consistent hashing
+
+```text
+ client ─► proxy worker ─┬─► node1   one pipelined connection per node per worker
+                          ├─► node2   (replies arrive in order per connection)
+                          └─► node3
+           per client: [slot1][slot2][slot3]...   replies released strictly in order
+```
+
+- **Routing:** `owner = ring.owner(key)`. The ring has 160 points per node, sorted. Lookup is a binary search, O(log V).
+- **Commands:** GET/SET go to the owner. Multi-key DEL is split per owner, sent in parallel and the counts summed. DBSIZE goes to every node and is summed. PING/INFO/QUIT/COMMAND are answered by the proxy itself.
+- **Ordering:** every command takes a numbered slot in its client's queue. A node's reply fills its slot, and only filled slots at the front are sent. Pipelined replies therefore stay in order even when nodes answer out of order.
+- **Back-pressure:** a client may have `proxy.max_pending_per_client` commands in flight. Beyond that the proxy stops reading from it until replies drain.
+- **Node failure:** connection refused/reset, `connect_timeout_ms` or `request_timeout_ms` fails every request waiting on that node with `-ERR node <id> (...) unavailable`. For `reconnect_backoff_ms` afterwards, requests to that node fail immediately instead of waiting. Other nodes are unaffected.
+- **Membership reload:** SIGHUP re-reads `proxy.nodes`. Workers pick up the new ring through a version counter, so there's no lock per request.
+- **No data migration:** after a membership change, moved keys are simply misses on their new owner (normal cache behaviour).
+
+**Known limitation (addressed in Phase 5):** stale copies stay on a key's old owner. If membership changes back, those keys route to the old owner again and can return outdated values. Per-key versioning or flushing a node when it rejoins will handle this.
+
+**Measured** (`benchmarks/results.md`): adding a 4th node moved 23% of keys, all to the new node. `hash % N` would move 75%. Live cluster: 698 of 3,000 keys (23.3%) moved after adding node4.

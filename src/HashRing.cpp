@@ -1,0 +1,72 @@
+#include "cachegrid/HashRing.h"
+
+#include <algorithm>
+#include <stdexcept>
+
+namespace cachegrid {
+
+std::uint64_t HashRing::hash(std::string_view data) {
+  // FNV-1a: a tiny, well-known hash. Its published constants are part of the
+  // algorithm's definition, not tunables.
+  constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
+  constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+  std::uint64_t h = kFnvOffset;
+  for (unsigned char c : data) {
+    h ^= c;
+    h *= kFnvPrime;
+  }
+  // FNV alone mixes the last bytes poorly ("node1#1" vs "node1#2" land close
+  // together). MurmurHash3's 64-bit finalizer scrambles every input bit into
+  // every output bit, giving well-spread ring positions.
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  h *= 0xc4ceb9fe1a85ec53ULL;
+  h ^= h >> 33;
+  return h;
+}
+
+HashRing::HashRing(std::size_t vnodes_per_node) : vnodes_per_node_(vnodes_per_node) {
+  if (vnodes_per_node == 0) throw std::invalid_argument("vnodes_per_node must be >= 1");
+}
+
+void HashRing::add_node(const std::string& node_id) {
+  auto it = std::lower_bound(nodes_.begin(), nodes_.end(), node_id);
+  if (it != nodes_.end() && *it == node_id) return;
+  nodes_.insert(it, node_id);
+  rebuild();
+}
+
+void HashRing::remove_node(const std::string& node_id) {
+  auto it = std::lower_bound(nodes_.begin(), nodes_.end(), node_id);
+  if (it == nodes_.end() || *it != node_id) return;
+  nodes_.erase(it);
+  rebuild();
+}
+
+void HashRing::rebuild() {
+  // Positions depend only on node ids, never on insertion order, so every
+  // proxy with the same membership builds an identical ring.
+  ring_.clear();
+  ring_.reserve(nodes_.size() * vnodes_per_node_);
+  for (std::uint32_t n = 0; n < nodes_.size(); ++n) {
+    for (std::size_t v = 0; v < vnodes_per_node_; ++v) {
+      ring_.emplace_back(hash(nodes_[n] + "#" + std::to_string(v)), n);
+    }
+  }
+  // Sorting by (position, node index) also breaks the (astronomically rare)
+  // tie of two vnodes hashing to the same position deterministically.
+  std::sort(ring_.begin(), ring_.end());
+}
+
+const std::string& HashRing::owner(std::string_view key) const {
+  if (ring_.empty()) throw std::logic_error("HashRing::owner on empty ring");
+  const std::uint64_t h = hash(key);
+  // First point at or after h, i.e. "clockwise"...
+  auto it = std::lower_bound(ring_.begin(), ring_.end(), std::make_pair(h, std::uint32_t{0}));
+  // ...wrapping past the top of the circle back to the start.
+  if (it == ring_.end()) it = ring_.begin();
+  return nodes_[it->second];
+}
+
+}  // namespace cachegrid

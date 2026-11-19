@@ -1,13 +1,12 @@
 # Two-stage build:
 #   1. "build": compile and run the full test suite on Linux (exercises the
 #      epoll code path). The image build fails if any test fails.
-#   2. runtime: a slim image with just the server binary and its config.
+#   2. runtime: a slim image with the node and proxy binaries plus configs.
 #
+# Normally used through docker-compose.yml (3 nodes + proxy). Standalone:
 #   docker build -t cachegrid .
-#   docker run --rm -v "$PWD/config:/etc/cachegrid:ro" -p 7001:7001 cachegrid
-#
-# The container reads /etc/cachegrid/cachegrid.conf. For access from outside
-# the container that file must set server.bind_address = 0.0.0.0.
+#   docker run --rm -p 7001:7001 cachegrid                       # one node
+#   docker run --rm -p 7100:7100 cachegrid cachegrid-proxy /etc/cachegrid/docker/proxy.conf
 
 FROM ubuntu:24.04 AS build
 RUN apt-get update \
@@ -21,7 +20,7 @@ RUN cmake --preset release \
 
 FROM ubuntu:24.04
 COPY --from=build /src/build/release/cachegrid-server /usr/local/bin/cachegrid-server
-COPY config/cachegrid.conf /etc/cachegrid/cachegrid.conf
+COPY --from=build /src/build/release/cachegrid-proxy /usr/local/bin/cachegrid-proxy
+COPY config/ /etc/cachegrid/
 USER nobody
-ENTRYPOINT ["cachegrid-server"]
-CMD ["/etc/cachegrid/cachegrid.conf"]
+CMD ["cachegrid-server", "/etc/cachegrid/docker/node.conf"]

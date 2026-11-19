@@ -46,6 +46,15 @@ struct ParseResult {
 // end and never copies argument bytes until the whole command has arrived.
 ParseResult parse_command(std::string_view buf, const Limits& limits);
 
+// Finds the end of one complete *reply* at the front of `buf` without
+// interpreting it (the proxy forwards reply bytes verbatim). On Ok, `consumed`
+// is the reply's length. Replies longer than `max_bytes` are an Error.
+ParseStatus frame_reply(std::string_view buf, std::size_t max_bytes, std::size_t& consumed);
+
+// Encodes arguments as a RESP array of bulk strings (how commands are sent to
+// a node, whatever form the client used).
+std::string encode_command(const std::vector<std::string>& args);
+
 void write_simple(std::string& out, std::string_view s);
 void write_error(std::string& out, std::string_view message);
 void write_integer(std::string& out, std::int64_t n);

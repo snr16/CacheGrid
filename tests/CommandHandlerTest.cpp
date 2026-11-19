@@ -14,7 +14,7 @@ class CommandHandlerTest : public ::testing::Test {
   CommandHandlerTest() : cache_(make_opts()), handler_(cache_, [](std::string& o) { o += "x:1\r\n"; }) {}
 
   Cache::Options make_opts() {
-    Cache::Options o = cache_opts(1 << 20, 4);
+    Cache::Options o = cache_opts(cfg_bytes("test.handler.capacity"), cfg_size("test.handler.shards"));
     o.now = clock_.fn();
     return o;
   }
@@ -84,8 +84,9 @@ TEST_F(CommandHandlerTest, SetRejectsUnknownOption) {
 }
 
 TEST_F(CommandHandlerTest, SetTooLargeForShard) {
-  // 1 MiB over 4 shards = 256 KiB per shard.
-  EXPECT_EQ(run({"SET", "k", std::string(300 * 1024, 'x')}),
+  // One byte more than a whole shard can hold.
+  const std::size_t shard = cfg_bytes("test.handler.capacity") / cfg_size("test.handler.shards");
+  EXPECT_EQ(run({"SET", "k", std::string(shard + 1, 'x')}),
             "-ERR value too large for cache shard\r\n");
 }
 

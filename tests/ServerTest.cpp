@@ -1,182 +1,14 @@
 // End-to-end tests: a real server on a random free port, real TCP sockets.
 
-#include "cachegrid/CacheServer.h"
-#include "TestUtil.h"
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "TestNet.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <stdexcept>
 #include <thread>
 
 using namespace cachegrid;
 using namespace cachegrid::test;
-
-namespace {
-
-// ---- Test fixture values (independent of the shipped config) -------------------
-
-constexpr int kRecvTimeoutSec = 5;  // a hung test fails instead of blocking forever
-
-ServerOptions test_server_opts() {
-  ServerOptions o{};
-  o.bind_address = "127.0.0.1";
-  o.port = 0;  // OS picks a free port, so tests never collide
-  o.worker_threads = 2;
-  o.max_connections = 64;
-  o.listen_backlog = 128;
-  o.max_request_bytes = 1 << 20;
-  o.max_args = 1024;
-  o.max_output_buffer = 16 << 20;
-  o.read_chunk_bytes = 16 << 10;
-  o.events_per_poll = 64;
-  o.purge_interval = Millis(50);
-  o.fd_reserve = 64;
-  return o;
-}
-
-#ifdef MSG_NOSIGNAL
-constexpr int kSendFlags = MSG_NOSIGNAL;
-#else
-constexpr int kSendFlags = 0;
-#endif
-
-std::string encode(const std::vector<std::string>& args) {
-  std::string s = "*" + std::to_string(args.size()) + "\r\n";
-  for (const auto& a : args) s += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
-  return s;
-}
-
-// End index of the complete RESP reply starting at `pos`, or npos if more
-// bytes are needed.
-std::size_t reply_end(std::string_view b, std::size_t pos) {
-  if (pos >= b.size()) return std::string_view::npos;
-  const std::size_t crlf = b.find("\r\n", pos);
-  if (crlf == std::string_view::npos) return std::string_view::npos;
-  const char type = b[pos];
-  if (type == '+' || type == '-' || type == ':') return crlf + 2;
-  const long long n = std::stoll(std::string(b.substr(pos + 1, crlf - pos - 1)));
-  if (type == '$') {
-    if (n < 0) return crlf + 2;
-    const std::size_t end = crlf + 2 + static_cast<std::size_t>(n) + 2;
-    return end <= b.size() ? end : std::string_view::npos;
-  }
-  if (type == '*') {
-    std::size_t p = crlf + 2;
-    for (long long i = 0; i < n; ++i) {
-      p = reply_end(b, p);
-      if (p == std::string_view::npos) return p;
-    }
-    return p;
-  }
-  throw std::runtime_error("bad reply type");
-}
-
-// Minimal blocking client.
-class Client {
- public:
-  explicit Client(std::uint16_t port) {
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
-      throw std::runtime_error("connect failed");
-    }
-    timeval tv{kRecvTimeoutSec, 0};
-    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    int one = 1;
-    ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-#ifdef SO_NOSIGPIPE
-    ::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-  }
-  ~Client() { close(); }
-
-  void close() {
-    if (fd_ >= 0) ::close(fd_);
-    fd_ = -1;
-  }
-
-  void send_raw(std::string_view data) {
-    while (!data.empty()) {
-      const ssize_t n = ::send(fd_, data.data(), data.size(), kSendFlags);
-      if (n <= 0) throw std::runtime_error("send failed");
-      data.remove_prefix(static_cast<std::size_t>(n));
-    }
-  }
-
-  void shutdown_write() { ::shutdown(fd_, SHUT_WR); }
-
-  // Reads exactly one complete reply. Returns "" if the server closed first.
-  std::string read_reply() {
-    for (;;) {
-      const std::size_t end = reply_end(buf_, 0);
-      if (end != std::string::npos) {
-        std::string r = buf_.substr(0, end);
-        buf_.erase(0, end);
-        return r;
-      }
-      char tmp[64 * 1024];
-      const ssize_t n = ::recv(fd_, tmp, sizeof tmp, 0);
-      if (n <= 0) return "";
-      buf_.append(tmp, static_cast<std::size_t>(n));
-    }
-  }
-
-  std::string command(const std::vector<std::string>& args) {
-    send_raw(encode(args));
-    return read_reply();
-  }
-
-  // True once the server has closed the connection (EOF or reset).
-  bool wait_closed() {
-    char tmp[64 * 1024];
-    for (;;) {
-      const ssize_t n = ::recv(fd_, tmp, sizeof tmp, 0);
-      if (n == 0) return true;
-      if (n < 0) return errno != EAGAIN && errno != EWOULDBLOCK;  // timeout = still open
-    }
-  }
-
- private:
-  int fd_ = -1;
-  std::string buf_;
-};
-
-struct TestServer {
-  explicit TestServer(ServerOptions opts = test_server_opts())
-      : cache(cache_opts(64 << 20, 8)), server(std::move(opts), cache) {
-    server.start();
-  }
-  std::uint16_t port() const { return server.port(); }
-
-  Cache cache;
-  CacheServer server;
-};
-
-// Polls `cond` until true or a deadline passes.
-template <typename Fn>
-bool eventually(Fn cond) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kRecvTimeoutSec);
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (cond()) return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  }
-  return cond();
-}
-
-}  // namespace
 
 // ---- Basic request/response ------------------------------------------------------
 
@@ -206,12 +38,13 @@ TEST(Server, InlineCommands) {
 TEST(Server, PipelinedCommandsAllAnsweredInOrder) {
   TestServer s;
   Client c(s.port());
+  const int depth = cfg_int("test.server.pipeline_depth");
   std::string batch;
-  for (int i = 0; i < 500; ++i) batch += encode({"SET", "k" + std::to_string(i), std::to_string(i)});
-  for (int i = 0; i < 500; ++i) batch += encode({"GET", "k" + std::to_string(i)});
+  for (int i = 0; i < depth; ++i) batch += encode({"SET", "k" + std::to_string(i), std::to_string(i)});
+  for (int i = 0; i < depth; ++i) batch += encode({"GET", "k" + std::to_string(i)});
   c.send_raw(batch);
-  for (int i = 0; i < 500; ++i) ASSERT_EQ(c.read_reply(), "+OK\r\n");
-  for (int i = 0; i < 500; ++i) {
+  for (int i = 0; i < depth; ++i) ASSERT_EQ(c.read_reply(), "+OK\r\n");
+  for (int i = 0; i < depth; ++i) {
     const std::string v = std::to_string(i);
     ASSERT_EQ(c.read_reply(), "$" + std::to_string(v.size()) + "\r\n" + v + "\r\n");
   }
@@ -250,7 +83,7 @@ TEST(Server, MalformedRequestGetsErrorAndCloseOthersUnaffected) {
 
 TEST(Server, OversizedRequestRejected) {
   ServerOptions o = test_server_opts();
-  o.max_request_bytes = 1024;
+  o.net.max_request_bytes = 1024;
   TestServer s(o);
   Client c(s.port());
   c.send_raw(encode({"SET", "k", std::string(4096, 'x')}));
@@ -281,7 +114,7 @@ TEST(Server, HalfClosedClientStillGetsReplies) {
 
 TEST(Server, ClientThatNeverReadsIsDisconnectedAtOutputLimit) {
   ServerOptions o = test_server_opts();
-  o.max_output_buffer = 64 * 1024;
+  o.net.max_output_buffer = 64 * 1024;
   TestServer s(o);
   Client c(s.port());
   EXPECT_EQ(c.command({"SET", "v", std::string(32 * 1024, 'x')}), "+OK\r\n");
@@ -303,7 +136,7 @@ TEST(Server, QuitClosesConnection) {
 
 TEST(Server, MaxConnectionsEnforced) {
   ServerOptions o = test_server_opts();
-  o.max_connections = 2;
+  o.net.max_connections = 2;
   TestServer s(o);
   Client a(s.port());
   Client b(s.port());
@@ -322,8 +155,8 @@ TEST(Server, MaxConnectionsEnforced) {
 
 TEST(Server, ManyConcurrentClients) {
   TestServer s;
-  constexpr int kClients = 32;
-  constexpr int kOps = 200;
+  const int kClients = cfg_int("test.server.concurrent_clients");
+  const int kOps = cfg_int("test.server.ops_per_client");
   std::atomic<int> failures{0};
 
   std::vector<std::thread> threads;
