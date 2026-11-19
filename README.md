@@ -12,3 +12,19 @@ cmake --preset tsan  && cmake --build --preset tsan  -j && ctest --preset tsan
 ```
 
 Requires CMake ≥ 3.20 and a C++17 compiler. GoogleTest is downloaded automatically during the CMake configure step.
+
+## Configuration
+
+All tunables live in `config/`. There are no defaults hidden in code, and a missing or invalid key stops startup with an error naming the key.
+
+| File | Purpose |
+|---|---|
+| `config/cachegrid.conf` | Cache node settings: capacity, shard count, eviction policy |
+| `config/bench.conf` | Benchmark workloads |
+
+## Benchmarks
+
+```bash
+cmake --preset release && cmake --build --preset release -j
+./build/release/shard_contention config/bench.conf
+```

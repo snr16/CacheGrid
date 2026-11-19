@@ -24,11 +24,19 @@ elseif(NOT CACHEGRID_SANITIZER STREQUAL "")
 endif()
 
 # ---- Core library -----------------------------------------------------------
+find_package(Threads REQUIRED)
+
 add_library(cachegrid_core
+  src/Config.cpp
+  src/LRUCache.cpp
   src/Cache.cpp
 )
 target_include_directories(cachegrid_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(cachegrid_core PUBLIC cachegrid_options)
+target_link_libraries(cachegrid_core PUBLIC cachegrid_options Threads::Threads)
+
+# ---- Benchmarks -------------------------------------------------------------
+add_executable(shard_contention benchmarks/shard_contention.cpp)
+target_link_libraries(shard_contention PRIVATE cachegrid_core)
 
 # ---- Tests ------------------------------------------------------------------
 if(CACHEGRID_BUILD_TESTS)
@@ -44,8 +52,12 @@ if(CACHEGRID_BUILD_TESTS)
   enable_testing()
   add_executable(cachegrid_tests
     tests/CacheTest.cpp
+    tests/ConcurrencyTest.cpp
+    tests/ConfigTest.cpp
   )
   target_link_libraries(cachegrid_tests PRIVATE cachegrid_core GTest::gtest_main)
+  # Lets tests locate the shipped config files regardless of build directory.
+  target_compile_definitions(cachegrid_tests PRIVATE CACHEGRID_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   include(GoogleTest)
   gtest_discover_tests(cachegrid_tests)
 endif()
