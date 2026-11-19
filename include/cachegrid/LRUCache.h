@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace cachegrid {
 
@@ -24,6 +25,22 @@ enum class SetResult {
   InvalidTtl,   // ttl was provided but <= 0
   TooLarge,     // single entry larger than the whole cache (or shard)
   OutOfMemory,  // cache full and policy is NoEviction
+  Stale,        // versioned write ignored: the cache already holds a newer (or equal) version
+};
+
+// Result of a versioned delete.
+struct DelResult {
+  SetResult status;   // Ok (tombstone written) or Stale (a newer version exists)
+  bool removed_live;  // a live value was removed by this delete
+};
+
+// One entry as copied between nodes during recovery (see Cache::export_shard).
+struct ExportedEntry {
+  std::string key;
+  std::string value;
+  std::uint64_t version;
+  bool tombstone;
+  std::optional<Millis> ttl_remaining;  // nullopt = never expires
 };
 
 enum class EvictionPolicy {
@@ -57,6 +74,16 @@ struct LRUOptions {
 
 // Single-shard key/value store with TTL and LRU eviction.
 //
+// Versions and tombstones (used for replication, Phase 5):
+//   - Every entry carries a version number. Plain set() writes version 0.
+//   - set_versioned() only applies if its version is NEWER than the stored
+//     one, so replaying an old write can never overwrite a newer value
+//     ("last writer wins" by version).
+//   - del_versioned() leaves a *tombstone*: an entry that means "deleted at
+//     version V". It reads as missing, but still blocks older writes, so a
+//     delayed or re-copied old value can't bring a deleted key back to life.
+//     Tombstones expire after a TTL so they don't pile up forever.
+//
 // Data structure: hash map (key -> list iterator) + doubly linked list ordered
 // by recency (front = most recently used, back = least). Every operation is
 // O(1) on average:
@@ -82,13 +109,31 @@ class LRUCache {
   // missing or expired.
   std::optional<std::string> get(const std::string& key);
 
-  // Returns true if a live key was removed.
+  // Returns true if a live key was removed. Removes tombstones too (an
+  // unconditional delete, used for local administration and trimming).
   bool del(const std::string& key);
+
+  // Applies only if `version` is newer than the stored entry's version
+  // (live or tombstone). Otherwise returns Stale and changes nothing.
+  SetResult set_versioned(const std::string& key, std::string value, std::optional<Millis> ttl,
+                          std::uint64_t version);
+
+  // Replaces the entry with a tombstone at `version` (kept for
+  // `tombstone_ttl`), unless a newer version is stored.
+  DelResult del_versioned(const std::string& key, std::uint64_t version, Millis tombstone_ttl);
+
+  // All non-expired entries (live and tombstones), with remaining TTLs.
+  std::vector<ExportedEntry> export_entries() const;
+
+  // Removes everything.
+  void clear();
 
   // Removes every expired entry; returns how many were removed. O(n).
   std::size_t purge_expired();
 
-  std::size_t size() const { return map_.size(); }
+  // Live keys (tombstones excluded).
+  std::size_t size() const { return map_.size() - tombstones_; }
+  std::size_t tombstone_count() const { return tombstones_; }
   std::size_t used_bytes() const { return used_bytes_; }
   std::size_t capacity_bytes() const { return capacity_bytes_; }
   const CacheStats& stats() const { return stats_; }
@@ -109,6 +154,8 @@ class LRUCache {
     std::string key;
     std::string value;
     std::optional<TimePoint> expires_at;  // nullopt = never expires
+    std::uint64_t version = 0;
+    bool tombstone = false;
   };
   using List = std::list<Node>;
   using Map = std::unordered_map<std::string, List::iterator>;
@@ -118,11 +165,15 @@ class LRUCache {
   }
   void touch(List::iterator it) { lru_.splice(lru_.begin(), lru_, it); }
   void erase(Map::iterator it);
+  // Shared by set(), set_versioned() and del_versioned().
+  SetResult write(const std::string& key, std::string value, std::optional<Millis> ttl,
+                  std::uint64_t version, bool check_version, bool tombstone);
   void evict_until_fits(TimePoint now);
 
   std::size_t capacity_bytes_;
   std::size_t entry_overhead_bytes_;
   std::size_t used_bytes_ = 0;
+  std::size_t tombstones_ = 0;
   NowFn now_;
   EvictionPolicy policy_;
   List lru_;  // front = most recently used

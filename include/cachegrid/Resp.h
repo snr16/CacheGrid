@@ -51,6 +51,20 @@ ParseResult parse_command(std::string_view buf, const Limits& limits);
 // is the reply's length. Replies longer than `max_bytes` are an Error.
 ParseStatus frame_reply(std::string_view buf, std::size_t max_bytes, std::size_t& consumed);
 
+// A decoded reply (used where the proxy needs to look inside a reply, e.g.
+// the entries returned by SCAN during recovery).
+struct Value {
+  enum class Type { Simple, Error, Integer, Bulk, Null, Array };
+  Type type = Type::Null;
+  std::string str;              // Simple, Error, Bulk
+  std::int64_t integer = 0;     // Integer
+  std::vector<Value> elements;  // Array
+};
+
+// Decodes one complete reply (as framed by frame_reply). Returns false on
+// malformed input.
+bool decode_reply(std::string_view buf, Value& out);
+
 // Encodes arguments as a RESP array of bulk strings (how commands are sent to
 // a node, whatever form the client used).
 std::string encode_command(const std::vector<std::string>& args);

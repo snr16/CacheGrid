@@ -55,6 +55,11 @@ class CacheServer {
 
   std::size_t active_connections() const { return active_.load(); }
 
+  // Random id chosen when this server object is created. The proxy compares
+  // it between health checks: a different id means the node restarted (and
+  // lost its data), even if it came back too fast to ever look "down".
+  const std::string& run_id() const { return run_id_; }
+
  private:
   class Worker;
   friend class Worker;
@@ -64,6 +69,7 @@ class CacheServer {
 
   ServerOptions opts_;
   Cache& cache_;
+  std::string run_id_;
   int listen_fd_ = -1;
   std::uint16_t bound_port_ = 0;
   std::atomic<bool> stopping_{false};

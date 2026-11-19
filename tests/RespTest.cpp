@@ -186,3 +186,23 @@ TEST(RespFrameReply, RejectsGarbageAndOversize) {
 TEST(RespEncode, CommandAsBulkArray) {
   EXPECT_EQ(encode_command({"SET", "k", ""}), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n");
 }
+
+// ---- Decoding replies ---------------------------------------------------------------
+
+TEST(RespDecode, NestedArrayWithAllTypes) {
+  Value v;
+  ASSERT_TRUE(decode_reply("*4\r\n:5\r\n$3\r\nabc\r\n$-1\r\n*1\r\n+ok\r\n", v));
+  ASSERT_EQ(v.type, Value::Type::Array);
+  ASSERT_EQ(v.elements.size(), 4u);
+  EXPECT_EQ(v.elements[0].integer, 5);
+  EXPECT_EQ(v.elements[1].str, "abc");
+  EXPECT_EQ(v.elements[2].type, Value::Type::Null);
+  EXPECT_EQ(v.elements[3].elements[0].str, "ok");
+}
+
+TEST(RespDecode, RejectsTruncatedOrTrailingBytes) {
+  Value v;
+  EXPECT_FALSE(decode_reply("*2\r\n:1\r\n", v));
+  EXPECT_FALSE(decode_reply("+OK\r\nextra", v));
+  EXPECT_FALSE(decode_reply("$5\r\nab\r\n", v));
+}

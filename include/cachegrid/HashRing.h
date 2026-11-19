@@ -39,6 +39,12 @@ class HashRing {
   // The node that owns `key`. Ring must not be empty. O(log V).
   const std::string& owner(std::string_view key) const;
 
+  // The first `n` *distinct* nodes found walking clockwise from `key`: the
+  // owner first, then its replicas (fewer if the ring has fewer nodes).
+  // Virtual nodes of an already-chosen node are skipped, so replicas always
+  // land on different machines.
+  std::vector<std::string> owners(std::string_view key, std::size_t n) const;
+
   bool empty() const { return nodes_.empty(); }
   std::size_t node_count() const { return nodes_.size(); }
   const std::vector<std::string>& nodes() const { return nodes_; }

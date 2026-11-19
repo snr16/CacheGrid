@@ -130,3 +130,31 @@ TEST(HashRing, RemoveThenReAddRestoresPlacement) {
   r.add_node("node2");
   for (int i = 0; i < kKeys; ++i) ASSERT_EQ(r.owner(key(i)), original.owner(key(i)));
 }
+
+// ---- Replica placement ----------------------------------------------------------
+
+TEST(HashRingOwners, OwnerFirstThenDistinctReplicas) {
+  const HashRing r = ring_of({"node1", "node2", "node3"});
+  for (int i = 0; i < kKeys; ++i) {
+    const auto o = r.owners(key(i), 2);
+    ASSERT_EQ(o.size(), 2u);
+    ASSERT_EQ(o[0], r.owner(key(i)));
+    ASSERT_NE(o[0], o[1]) << "two copies must be on different nodes";
+  }
+}
+
+TEST(HashRingOwners, CappedAtNodeCount) {
+  const HashRing r = ring_of({"node1", "node2"});
+  EXPECT_EQ(r.owners("k", 5).size(), 2u);
+}
+
+TEST(HashRingOwners, ReplicasSpreadAcrossNodes) {
+  // Each node should hold roughly 2/3 of keys when 3 nodes keep 2 copies.
+  const HashRing r = ring_of({"node1", "node2", "node3"});
+  std::map<std::string, int> copies;
+  for (int i = 0; i < kKeys; ++i) {
+    for (const auto& n : r.owners(key(i), 2)) ++copies[n];
+  }
+  const double ideal = kKeys * 2.0 / 3.0;
+  for (const auto& [id, c] : copies) EXPECT_NEAR(c, ideal, ideal * kBalanceTol) << id;
+}

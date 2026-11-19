@@ -21,6 +21,8 @@ Cache::Options Cache::Options::from_config(const Config& cfg) {
   } else {
     throw ConfigError("'cache.eviction_policy' must be 'lru' or 'noeviction', got '" + policy + "'");
   }
+  o.tombstone_ttl = Millis(cfg.get_size("cache.tombstone_ttl_ms"));
+  if (o.tombstone_ttl.count() == 0) throw ConfigError("'cache.tombstone_ttl_ms' must be >= 1");
   if (o.num_shards == 0) throw ConfigError("'cache.num_shards' must be >= 1");
   if (o.capacity_bytes < o.num_shards) {
     throw ConfigError("'cache.capacity' must be at least one byte per shard");
@@ -28,7 +30,7 @@ Cache::Options Cache::Options::from_config(const Config& cfg) {
   return o;
 }
 
-Cache::Cache(Options opts) : capacity_bytes_(opts.capacity_bytes) {
+Cache::Cache(Options opts) : capacity_bytes_(opts.capacity_bytes), tombstone_ttl_(opts.tombstone_ttl) {
   if (opts.num_shards == 0) throw std::invalid_argument("num_shards must be >= 1");
   const LRUOptions shard_opts{opts.capacity_bytes / opts.num_shards, opts.entry_overhead_bytes,
                               opts.policy};
@@ -64,6 +66,32 @@ bool Cache::del(const std::string& key) {
   Shard& s = shard_for(key);
   std::lock_guard<std::mutex> lock(s.mu);
   return s.lru.del(key);
+}
+
+SetResult Cache::set_versioned(const std::string& key, std::string value, std::optional<Millis> ttl,
+                               std::uint64_t version) {
+  Shard& s = shard_for(key);
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.lru.set_versioned(key, std::move(value), ttl, version);
+}
+
+DelResult Cache::del_versioned(const std::string& key, std::uint64_t version) {
+  Shard& s = shard_for(key);
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.lru.del_versioned(key, version, tombstone_ttl_);
+}
+
+std::vector<ExportedEntry> Cache::export_shard(std::size_t index) const {
+  const Shard& s = *shards_.at(index);
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.lru.export_entries();
+}
+
+void Cache::clear() {
+  for (auto& s : shards_) {
+    std::lock_guard<std::mutex> lock(s->mu);
+    s->lru.clear();
+  }
 }
 
 std::size_t Cache::purge_expired() {

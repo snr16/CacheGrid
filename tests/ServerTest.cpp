@@ -98,7 +98,7 @@ TEST(Server, ClientDisconnectMidCommandIsCleanedUp) {
     EXPECT_EQ(c.command({"PING"}), "+PONG\r\n");
     c.send_raw("*3\r\n$3\r\nSET\r\n$1\r\nk");  // half a command, then vanish
   }
-  EXPECT_TRUE(eventually([&] { return s.server.active_connections() == 0; }));
+  EXPECT_TRUE(eventually([&] { return s.server->active_connections() == 0; }));
   Client c2(s.port());
   EXPECT_EQ(c2.command({"GET", "k"}), "$-1\r\n");
 }
@@ -122,7 +122,7 @@ TEST(Server, ClientThatNeverReadsIsDisconnectedAtOutputLimit) {
   for (int i = 0; i < 100; ++i) flood += encode({"GET", "v"});  // ~3.2 MB of replies
   c.send_raw(flood);
   EXPECT_TRUE(c.wait_closed());
-  EXPECT_TRUE(eventually([&] { return s.server.active_connections() == 0; }));
+  EXPECT_TRUE(eventually([&] { return s.server->active_connections() == 0; }));
 }
 
 TEST(Server, QuitClosesConnection) {
@@ -148,7 +148,7 @@ TEST(Server, MaxConnectionsEnforced) {
   EXPECT_TRUE(extra.wait_closed());
 
   a.close();  // frees a slot
-  EXPECT_TRUE(eventually([&] { return s.server.active_connections() == 1; }));
+  EXPECT_TRUE(eventually([&] { return s.server->active_connections() == 1; }));
   Client again(s.port());
   EXPECT_EQ(again.command({"PING"}), "+PONG\r\n");
 }
@@ -182,9 +182,9 @@ TEST(Server, StopClosesOpenConnections) {
   TestServer s;
   Client c(s.port());
   EXPECT_EQ(c.command({"PING"}), "+PONG\r\n");
-  s.server.stop();
+  s.server->stop();
   EXPECT_TRUE(c.wait_closed());
-  EXPECT_EQ(s.server.active_connections(), 0u);
+  EXPECT_EQ(s.server->active_connections(), 0u);
 }
 
 TEST(Server, InfoReportsConnections) {

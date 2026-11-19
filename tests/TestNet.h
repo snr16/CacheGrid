@@ -15,6 +15,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -144,13 +145,28 @@ class Client {
 struct TestServer {
   explicit TestServer(ServerOptions opts = test_server_opts())
       : cache(cache_opts(cfg_bytes("test.server.cache_capacity"), cfg_size("test.server.cache_shards"))),
-        server(std::move(opts), cache) {
-    server.start();
+        server(std::make_unique<CacheServer>(std::move(opts), cache)) {
+    server->start();
+    port_ = server->port();
   }
-  std::uint16_t port() const { return server.port(); }
+  std::uint16_t port() const { return port_; }
+
+  // Stops serving but KEEPS the cached data, like a node cut off by a network
+  // partition (as opposed to a crash, which loses everything).
+  void stop() { server->stop(); }
+  // Starts serving again on the same port, with whatever data it still has.
+  void resume() {
+    ServerOptions o = test_server_opts();
+    o.net.port = port_;
+    server = std::make_unique<CacheServer>(o, cache);
+    server->start();
+  }
 
   Cache cache;
-  CacheServer server;
+  std::unique_ptr<CacheServer> server;
+
+ private:
+  std::uint16_t port_ = 0;
 };
 
 // Polls `cond` until true or a deadline passes.

@@ -5,8 +5,22 @@ A distributed in-memory key-value cache in C++17, with consistent hashing, LRU e
 ```text
 clients ──RESP──► cachegrid-proxy ──► node1 ┐
                   (consistent hash   ► node2 ├ cachegrid-server (sharded LRU + TTL)
-                   with vnodes)      ► node3 ┘
+                   with vnodes,      ► node3 ┘
+                   2 copies per key,
+                   health checks,
+                   automatic recovery)
 ```
+
+## Replication and failure handling
+
+- Every key is stored on **2 nodes** (`proxy.replication_factor`): its owner on the hash ring and the next node clockwise.
+- Writes go to every copy and succeed once `proxy.write_quorum` copies confirm.
+- Reads use the first healthy copy and **fail over** to the other one immediately if a node doesn't answer.
+- Writes carry a version number. Nodes keep only the newest version (last writer wins), and deletes leave *tombstones* so stale copies can't bring a key back.
+- The proxy **health-checks** every node. A node that stops answering is marked down. When it returns, or if it restarted unnoticed, the proxy wipes it and refills it from its peers before reading from it again.
+- Adding or removing a node (SIGHUP) **moves the data**: new owners are filled, old copies are trimmed, and no reads miss.
+
+`INFO` on the proxy shows each node's state (`up` / `down` / `recovering`). Design details and the exact consistency guarantees are in `docs/architecture.md`.
 
 ## Build & test
 
@@ -35,7 +49,14 @@ docker compose --profile scale up -d node4
 # add node4@node4:7001 to proxy.nodes in config/docker/proxy.conf, then:
 docker compose kill -s HUP proxy
 ```
-Only the keys that now belong to node4 move (~1/4); see `benchmarks/results.md`.
+Only the keys that now belong to node4 move (~1/4), and they're copied there automatically; see `benchmarks/results.md`.
+
+**Simulating failures:**
+```bash
+docker compose stop node2       # reads and writes keep working (failover to the other copy)
+docker compose start node2      # proxy logs: DOWN -> recovering -> UP
+docker compose logs -f proxy    # watch it happen
+```
 
 ## Running locally without Docker
 

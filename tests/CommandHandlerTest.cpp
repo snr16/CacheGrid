@@ -1,4 +1,5 @@
 #include "cachegrid/CommandHandler.h"
+#include "cachegrid/Resp.h"
 #include "TestUtil.h"
 
 #include <gtest/gtest.h>
@@ -11,7 +12,7 @@ namespace {
 
 class CommandHandlerTest : public ::testing::Test {
  protected:
-  CommandHandlerTest() : cache_(make_opts()), handler_(cache_, [](std::string& o) { o += "x:1\r\n"; }) {}
+  CommandHandlerTest() : cache_(make_opts()), handler_(cache_, [](std::string& o) { o += "x:1\r\n"; }, "test-run-id") {}
 
   Cache::Options make_opts() {
     Cache::Options o = cache_opts(cfg_bytes("test.handler.capacity"), cfg_size("test.handler.shards"));
@@ -135,4 +136,55 @@ TEST_F(CommandHandlerTest, InfoIncludesServerAndCacheStats) {
 
 TEST_F(CommandHandlerTest, CommandReturnsEmptyArrayForRedisCli) {
   EXPECT_EQ(run({"COMMAND", "DOCS"}), "*0\r\n");
+}
+
+// ---- Internal replication commands -------------------------------------------
+
+TEST_F(CommandHandlerTest, VsetAppliesOnlyNewerVersions) {
+  EXPECT_EQ(run({"VSET", "10", "k", "a"}), "+OK\r\n");
+  EXPECT_EQ(run({"VSET", "9", "k", "old"}), "+STALE\r\n");
+  EXPECT_EQ(run({"VSET", "11", "k", "b", "PX", "100"}), "+OK\r\n");
+  EXPECT_EQ(run({"GET", "k"}), "$1\r\nb\r\n");
+  clock_.advance(Millis(100));
+  EXPECT_EQ(run({"GET", "k"}), "$-1\r\n");
+}
+
+TEST_F(CommandHandlerTest, VsetRejectsBadVersionAndArity) {
+  EXPECT_EQ(run({"VSET", "0", "k", "v"}), "-ERR invalid version\r\n");
+  EXPECT_EQ(run({"VSET", "abc", "k", "v"}), "-ERR invalid version\r\n");
+  EXPECT_EQ(run({"VSET", "99999999999999999999999", "k", "v"}), "-ERR invalid version\r\n");
+  EXPECT_EQ(run({"VSET", "1", "k"}), "-ERR wrong number of arguments for 'vset' command\r\n");
+}
+
+TEST_F(CommandHandlerTest, VdelLeavesTombstone) {
+  run({"VSET", "10", "k", "v"});
+  EXPECT_EQ(run({"VDEL", "20", "k"}), ":1\r\n");
+  EXPECT_EQ(run({"VDEL", "21", "k"}), ":0\r\n") << "already deleted";
+  EXPECT_EQ(run({"VSET", "15", "k", "zombie"}), "+STALE\r\n");
+  EXPECT_EQ(run({"GET", "k"}), "$-1\r\n");
+}
+
+TEST_F(CommandHandlerTest, ScanReturnsShardEntries) {
+  run({"VSET", "42", "k", "v"});
+  const std::size_t shard = cache_.shard_index("k");
+  const std::string reply = run({"SCAN", std::to_string(shard)});
+  resp::Value v;
+  ASSERT_TRUE(resp::decode_reply(reply, v)) << reply;
+  ASSERT_EQ(v.elements.size(), 2u);
+  EXPECT_EQ(static_cast<std::size_t>(v.elements[0].integer), cache_.num_shards());
+  ASSERT_EQ(v.elements[1].elements.size(), 1u);
+  const auto& e = v.elements[1].elements[0];
+  EXPECT_EQ(e.elements[0].str, "k");
+  EXPECT_EQ(e.elements[1].str, "42");
+  EXPECT_EQ(e.elements[2].integer, -1) << "no TTL";
+  EXPECT_EQ(e.elements[3].integer, 0) << "not a tombstone";
+  EXPECT_EQ(e.elements[4].str, "v");
+  EXPECT_EQ(run({"SCAN", std::to_string(cache_.num_shards())}), "-ERR shard index out of range\r\n");
+}
+
+TEST_F(CommandHandlerTest, FlushallAndRunid) {
+  run({"SET", "a", "1"});
+  EXPECT_EQ(run({"FLUSHALL"}), "+OK\r\n");
+  EXPECT_EQ(run({"DBSIZE"}), ":0\r\n");
+  EXPECT_EQ(run({"RUNID"}), "$11\r\ntest-run-id\r\n");
 }

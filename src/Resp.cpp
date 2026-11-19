@@ -199,6 +199,68 @@ ParseStatus frame_reply(std::string_view buf, std::size_t max_bytes, std::size_t
   return st;
 }
 
+namespace {
+
+bool decode_at(std::string_view buf, std::size_t& pos, Value& out) {
+  if (pos >= buf.size()) return false;
+  const char type = buf[pos];
+  const std::size_t end = buf.find(kCrlf, pos);
+  if (end == std::string_view::npos) return false;
+  const std::string_view line = buf.substr(pos + 1, end - pos - 1);
+  pos = end + kCrlf.size();
+
+  switch (type) {
+    case '+':
+      out.type = Value::Type::Simple;
+      out.str.assign(line);
+      return true;
+    case '-':
+      out.type = Value::Type::Error;
+      out.str.assign(line);
+      return true;
+    case ':':
+      out.type = Value::Type::Integer;
+      return parse_int64(line, out.integer);
+    case '$': {
+      std::int64_t n = 0;
+      if (!parse_int64(line, n) || n < -1) return false;
+      if (n == -1) {
+        out.type = Value::Type::Null;
+        return true;
+      }
+      const auto len = static_cast<std::size_t>(n);
+      if (buf.size() - pos < len + kCrlf.size()) return false;
+      out.type = Value::Type::Bulk;
+      out.str.assign(buf.substr(pos, len));
+      pos += len + kCrlf.size();
+      return true;
+    }
+    case '*': {
+      std::int64_t n = 0;
+      if (!parse_int64(line, n) || n < -1) return false;
+      if (n == -1) {
+        out.type = Value::Type::Null;
+        return true;
+      }
+      out.type = Value::Type::Array;
+      out.elements.resize(static_cast<std::size_t>(n));
+      for (auto& e : out.elements) {
+        if (!decode_at(buf, pos, e)) return false;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+bool decode_reply(std::string_view buf, Value& out) {
+  std::size_t pos = 0;
+  return decode_at(buf, pos, out) && pos == buf.size();
+}
+
 std::string encode_command(const std::vector<std::string>& args) {
   std::string out;
   write_array_header(out, args.size());

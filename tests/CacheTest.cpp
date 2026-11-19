@@ -380,3 +380,98 @@ TEST(CacheLru, MatchesReferenceModelOnRandomOperations) {
   }
   EXPECT_TRUE(real.check_invariants());
 }
+
+// ---- Versions and tombstones (replication) -----------------------------------
+
+TEST(CacheVersioned, NewerVersionApplies) {
+  LRUCache c(lru_opts(kBig));
+  EXPECT_EQ(c.set_versioned("k", "a", std::nullopt, 10), SetResult::Ok);
+  EXPECT_EQ(c.set_versioned("k", "b", std::nullopt, 11), SetResult::Ok);
+  EXPECT_EQ(c.get("k"), "b");
+}
+
+TEST(CacheVersioned, OlderOrEqualVersionIsStale) {
+  LRUCache c(lru_opts(kBig));
+  c.set_versioned("k", "new", std::nullopt, 10);
+  EXPECT_EQ(c.set_versioned("k", "old", std::nullopt, 9), SetResult::Stale);
+  EXPECT_EQ(c.set_versioned("k", "dup", std::nullopt, 10), SetResult::Stale) << "replayed write";
+  EXPECT_EQ(c.get("k"), "new");
+}
+
+TEST(CacheVersioned, TombstoneReadsAsMissingAndBlocksOlderWrites) {
+  LRUCache c(lru_opts(kBig));
+  c.set_versioned("k", "v", std::nullopt, 10);
+  const DelResult d = c.del_versioned("k", 20, Millis(1000));
+  EXPECT_EQ(d.status, SetResult::Ok);
+  EXPECT_TRUE(d.removed_live);
+  EXPECT_EQ(c.get("k"), std::nullopt);
+  EXPECT_EQ(c.size(), 0u) << "tombstones don't count as keys";
+  EXPECT_EQ(c.tombstone_count(), 1u);
+  EXPECT_EQ(c.set_versioned("k", "zombie", std::nullopt, 15), SetResult::Stale) << "older value must not return";
+  EXPECT_EQ(c.set_versioned("k", "reborn", std::nullopt, 25), SetResult::Ok) << "a newer write may";
+  EXPECT_EQ(c.get("k"), "reborn");
+  EXPECT_EQ(c.tombstone_count(), 0u);
+  EXPECT_TRUE(c.check_invariants());
+}
+
+TEST(CacheVersioned, DeleteOfMissingKeyStillLeavesTombstone) {
+  LRUCache c(lru_opts(kBig));
+  const DelResult d = c.del_versioned("k", 20, Millis(1000));
+  EXPECT_EQ(d.status, SetResult::Ok);
+  EXPECT_FALSE(d.removed_live);
+  // A delayed older write arriving after the delete is rejected.
+  EXPECT_EQ(c.set_versioned("k", "late", std::nullopt, 5), SetResult::Stale);
+}
+
+TEST(CacheVersioned, OlderDeleteIsStale) {
+  LRUCache c(lru_opts(kBig));
+  c.set_versioned("k", "v", std::nullopt, 30);
+  const DelResult d = c.del_versioned("k", 20, Millis(1000));
+  EXPECT_EQ(d.status, SetResult::Stale);
+  EXPECT_FALSE(d.removed_live);
+  EXPECT_EQ(c.get("k"), "v");
+}
+
+TEST(CacheVersioned, TombstoneExpires) {
+  FakeClock clk;
+  LRUCache c(lru_opts(kBig), clk.fn());
+  c.del_versioned("k", 20, Millis(100));
+  clk.advance(Millis(100));
+  EXPECT_EQ(c.set_versioned("k", "after", std::nullopt, 5), SetResult::Ok) << "expired tombstone no longer blocks";
+}
+
+TEST(CacheVersioned, PlainSetUsesVersionZero) {
+  LRUCache c(lru_opts(kBig));
+  c.set("k", "plain");
+  EXPECT_EQ(c.set_versioned("k", "replicated", std::nullopt, 1), SetResult::Ok);
+}
+
+TEST(CacheVersioned, ExportIncludesVersionsTombstonesAndRemainingTtl) {
+  FakeClock clk;
+  LRUCache c(lru_opts(kBig), clk.fn());
+  c.set_versioned("live", "v", Millis(1000), 7);
+  c.del_versioned("dead", 8, Millis(500));
+  c.set("forever", "f");
+  clk.advance(Millis(400));
+  auto entries = c.export_entries();
+  ASSERT_EQ(entries.size(), 3u);
+  std::sort(entries.begin(), entries.end(), [](auto& a, auto& b) { return a.key < b.key; });
+  EXPECT_EQ(entries[0].key, "dead");
+  EXPECT_TRUE(entries[0].tombstone);
+  EXPECT_EQ(entries[0].ttl_remaining, Millis(100));
+  EXPECT_EQ(entries[1].key, "forever");
+  EXPECT_EQ(entries[1].ttl_remaining, std::nullopt);
+  EXPECT_EQ(entries[2].version, 7u);
+  EXPECT_EQ(entries[2].ttl_remaining, Millis(600));
+}
+
+TEST(CacheVersioned, ClearEmptiesEverything) {
+  LRUCache c(lru_opts(kBig));
+  c.set("a", "1");
+  c.del_versioned("b", 3, Millis(1000));
+  c.clear();
+  EXPECT_EQ(c.size(), 0u);
+  EXPECT_EQ(c.tombstone_count(), 0u);
+  EXPECT_EQ(c.used_bytes(), 0u);
+  EXPECT_TRUE(c.check_invariants());
+}

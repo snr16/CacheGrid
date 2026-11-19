@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
@@ -43,7 +44,7 @@ class CacheServer::Worker {
  public:
   explicit Worker(CacheServer& server)
       : server_(server),
-        handler_(server.cache_, [&server](std::string& out) { server.append_info(out); }),
+        handler_(server.cache_, [&server](std::string& out) { server.append_info(out); }, server.run_id_),
         read_buf_(server.opts_.net.read_chunk_bytes),
         limits_{server.opts_.net.max_request_bytes, server.opts_.net.max_args} {
     int fds[2];
@@ -248,7 +249,22 @@ class CacheServer::Worker {
 
 // ---- CacheServer ---------------------------------------------------------------
 
-CacheServer::CacheServer(ServerOptions opts, Cache& cache) : opts_(std::move(opts)), cache_(cache) {}
+namespace {
+// 128 random bits as hex. std::random_device asks the OS for real randomness.
+std::string make_run_id() {
+  std::random_device rd;
+  std::string id;
+  for (int i = 0; i < 4; ++i) {
+    char part[9];
+    std::snprintf(part, sizeof part, "%08x", static_cast<unsigned>(rd()));
+    id += part;
+  }
+  return id;
+}
+}  // namespace
+
+CacheServer::CacheServer(ServerOptions opts, Cache& cache)
+    : opts_(std::move(opts)), cache_(cache), run_id_(make_run_id()) {}
 
 CacheServer::~CacheServer() { stop(); }
 
@@ -304,6 +320,7 @@ void CacheServer::purge_loop() {
 }
 
 void CacheServer::append_info(std::string& out) const {
+  out += "run_id:" + run_id_ + "\r\n";
   out += "connected_clients:" + std::to_string(active_.load()) + "\r\n";
   out += "total_connections_received:" + std::to_string(total_accepted_.load()) + "\r\n";
   out += "rejected_connections:" + std::to_string(rejected_.load()) + "\r\n";

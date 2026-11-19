@@ -37,6 +37,7 @@ add_library(cachegrid_core
   src/CacheServer.cpp
   src/HashRing.cpp
   src/ProxyServer.cpp
+  src/NodeClient.cpp
 )
 target_include_directories(cachegrid_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(cachegrid_core PUBLIC cachegrid_options Threads::Threads)
@@ -75,6 +76,7 @@ if(CACHEGRID_BUILD_TESTS)
     tests/ServerTest.cpp
     tests/HashRingTest.cpp
     tests/ProxyTest.cpp
+    tests/NodeClientTest.cpp
   )
   target_link_libraries(cachegrid_tests PRIVATE cachegrid_core GTest::gtest_main)
   # Lets tests locate the shipped config files regardless of build directory.

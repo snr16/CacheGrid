@@ -103,16 +103,18 @@ TEST(CacheOptionsFromConfig, ReadsAllFields) {
       "cache.capacity = 1MB\n"
       "cache.num_shards = 8\n"
       "cache.eviction_policy = noeviction\n"
-      "cache.entry_overhead_bytes = 100\n");
+      "cache.entry_overhead_bytes = 100\n"
+      "cache.tombstone_ttl_ms = 5000\n");
   const auto o = Cache::Options::from_config(c);
   EXPECT_EQ(o.capacity_bytes, 1u << 20);
   EXPECT_EQ(o.num_shards, 8u);
   EXPECT_EQ(o.policy, EvictionPolicy::NoEviction);
   EXPECT_EQ(o.entry_overhead_bytes, 100u);
+  EXPECT_EQ(o.tombstone_ttl, Millis(5000));
 }
 
 TEST(CacheOptionsFromConfig, RejectsBadPolicyAndZeroShards) {
-  const std::string base = "cache.capacity=1MB\ncache.entry_overhead_bytes=96\n";
+  const std::string base = "cache.capacity=1MB\ncache.entry_overhead_bytes=96\ncache.tombstone_ttl_ms=1000\n";
   EXPECT_THROW(Cache::Options::from_config(
                    Config::parse(base + "cache.num_shards=8\ncache.eviction_policy=fifo\n")),
                ConfigError);

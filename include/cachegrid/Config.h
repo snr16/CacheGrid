@@ -49,6 +49,8 @@ class Config {
   // Byte size with optional unit: 512, 512B, 64KB, 64MB, 2GB (1024-based,
   // case-insensitive).
   std::size_t get_bytes(const std::string& key) const;
+  // "true" or "false" (case-insensitive).
+  bool get_bool(const std::string& key) const;
   // Comma-separated list; items are trimmed, empty items rejected.
   std::vector<std::string> get_list(const std::string& key) const;
 

@@ -41,10 +41,12 @@ class Cache {
     std::size_t num_shards;
     std::size_t entry_overhead_bytes;
     EvictionPolicy policy;
+    Millis tombstone_ttl;    // how long a versioned delete's tombstone is kept
     NowFn now = Clock::now;  // injection point for tests, not a tunable
 
-    // Reads cache.capacity, cache.num_shards, cache.entry_overhead_bytes and
-    // cache.eviction_policy. Throws ConfigError on missing/invalid values.
+    // Reads cache.capacity, cache.num_shards, cache.entry_overhead_bytes,
+    // cache.eviction_policy and cache.tombstone_ttl_ms. Throws ConfigError on
+    // missing/invalid values.
     static Options from_config(const Config& cfg);
   };
 
@@ -56,7 +58,19 @@ class Cache {
   bool del(const std::string& key);
   std::size_t purge_expired();
 
-  std::size_t size() const;
+  // Replication support (see LRUCache for the version/tombstone rules).
+  SetResult set_versioned(const std::string& key, std::string value, std::optional<Millis> ttl,
+                          std::uint64_t version);
+  DelResult del_versioned(const std::string& key, std::uint64_t version);
+
+  // Copy of one shard's entries, for copying data to a recovering node.
+  // Throws std::out_of_range for a bad index.
+  std::vector<ExportedEntry> export_shard(std::size_t index) const;
+
+  // Removes every entry from every shard.
+  void clear();
+
+  std::size_t size() const;  // live keys (tombstones excluded)
   std::size_t used_bytes() const;
   std::size_t capacity_bytes() const { return capacity_bytes_; }
   std::size_t num_shards() const { return shards_.size(); }
@@ -78,6 +92,7 @@ class Cache {
   Shard& shard_for(const std::string& key) { return *shards_[shard_index(key)]; }
 
   std::size_t capacity_bytes_;
+  Millis tombstone_ttl_;
   // unique_ptr because std::mutex can't be moved, so Shard can't live
   // directly in a growable vector.
   std::vector<std::unique_ptr<Shard>> shards_;

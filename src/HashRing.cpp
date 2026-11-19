@@ -69,4 +69,20 @@ const std::string& HashRing::owner(std::string_view key) const {
   return nodes_[it->second];
 }
 
+std::vector<std::string> HashRing::owners(std::string_view key, std::size_t n) const {
+  if (ring_.empty()) throw std::logic_error("HashRing::owners on empty ring");
+  const std::size_t want = std::min(n, nodes_.size());
+  std::vector<std::string> out;
+  std::vector<bool> taken(nodes_.size(), false);
+  auto it = std::lower_bound(ring_.begin(), ring_.end(), std::make_pair(hash(key), std::uint32_t{0}));
+  for (std::size_t steps = 0; out.size() < want && steps < ring_.size(); ++steps, ++it) {
+    if (it == ring_.end()) it = ring_.begin();
+    if (!taken[it->second]) {
+      taken[it->second] = true;
+      out.push_back(nodes_[it->second]);
+    }
+  }
+  return out;
+}
+
 }  // namespace cachegrid

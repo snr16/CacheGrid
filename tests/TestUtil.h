@@ -42,6 +42,7 @@ inline Cache::Options cache_opts(std::size_t capacity, std::size_t shards) {
   o.num_shards = shards;
   o.entry_overhead_bytes = overhead();
   o.policy = EvictionPolicy::Lru;
+  o.tombstone_ttl = cfg_ms("test.tombstone_ttl_ms");
   return o;
 }
 

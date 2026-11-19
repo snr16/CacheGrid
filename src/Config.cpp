@@ -158,6 +158,13 @@ std::size_t Config::get_bytes(const std::string& key) const {
   return un * mult;
 }
 
+bool Config::get_bool(const std::string& key) const {
+  const std::string v = lower(get_string(key));
+  if (v == "true") return true;
+  if (v == "false") return false;
+  fail(key, "must be true or false, got '" + v + "'");
+}
+
 std::vector<std::string> Config::get_list(const std::string& key) const {
   const std::string v = get_string(key);
   std::vector<std::string> out;
