@@ -1,7 +1,11 @@
 #include "cachegrid/Cache.h"
+#include "cachegrid/CacheServer.h"
 #include "cachegrid/Config.h"
 
 #include <gtest/gtest.h>
+
+#include <fstream>
+#include <sstream>
 
 using namespace cachegrid;
 
@@ -136,4 +140,21 @@ TEST(ShippedConfig, BenchConfigHasAllKeys) {
   EXPECT_NO_THROW(c.get_list("bench.shard.shard_counts"));
   EXPECT_NO_THROW(c.get_list("bench.shard.thread_counts"));
   EXPECT_NO_THROW(c.get_string("bench.cache_config"));
+}
+
+TEST(ShippedConfig, ServerOptionsAreValid) {
+  const Config c = Config::load_file(CACHEGRID_SOURCE_DIR "/config/cachegrid.conf");
+  EXPECT_NO_THROW(ServerOptions::from_config(c));
+}
+
+TEST(ServerOptionsFromConfig, FdReserveMustCoverWorkers) {
+  // Rebuild the shipped file with an fd_reserve that's too small for 4 workers.
+  std::ifstream f(CACHEGRID_SOURCE_DIR "/config/cachegrid.conf");
+  std::stringstream ss;
+  ss << f.rdbuf();
+  std::string text = ss.str();
+  const auto pos = text.find("server.fd_reserve = ");
+  ASSERT_NE(pos, std::string::npos);
+  text = text.substr(0, pos) + "server.fd_reserve = 4\n";
+  EXPECT_THROW(ServerOptions::from_config(Config::parse(text)), ConfigError);
 }

@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <list>
 #include <random>
 #include <utility>
@@ -106,6 +107,13 @@ TEST(CacheTtl, NonPositiveTtlRejected) {
   LRUCache c(lru_opts(kBig));
   EXPECT_EQ(c.set("k", "v", 0ms), SetResult::InvalidTtl);
   EXPECT_EQ(c.set("k", "v", -5ms), SetResult::InvalidTtl);
+  EXPECT_EQ(c.size(), 0u);
+}
+
+TEST(CacheTtl, TtlBeyondClockRangeRejected) {
+  // now + ttl would overflow the clock's integer; must be rejected, not wrap.
+  LRUCache c(lru_opts(kBig));
+  EXPECT_EQ(c.set("k", "v", Millis(std::numeric_limits<Millis::rep>::max())), SetResult::InvalidTtl);
   EXPECT_EQ(c.size(), 0u);
 }
 

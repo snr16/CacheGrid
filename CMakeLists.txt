@@ -30,9 +30,17 @@ add_library(cachegrid_core
   src/Config.cpp
   src/LRUCache.cpp
   src/Cache.cpp
+  src/Resp.cpp
+  src/CommandHandler.cpp
+  src/Poller.cpp
+  src/CacheServer.cpp
 )
 target_include_directories(cachegrid_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(cachegrid_core PUBLIC cachegrid_options Threads::Threads)
+
+# ---- Server executable ------------------------------------------------------
+add_executable(cachegrid-server src/main.cpp)
+target_link_libraries(cachegrid-server PRIVATE cachegrid_core)
 
 # ---- Benchmarks -------------------------------------------------------------
 add_executable(shard_contention benchmarks/shard_contention.cpp)
@@ -54,6 +62,9 @@ if(CACHEGRID_BUILD_TESTS)
     tests/CacheTest.cpp
     tests/ConcurrencyTest.cpp
     tests/ConfigTest.cpp
+    tests/RespTest.cpp
+    tests/CommandHandlerTest.cpp
+    tests/ServerTest.cpp
   )
   target_link_libraries(cachegrid_tests PRIVATE cachegrid_core GTest::gtest_main)
   # Lets tests locate the shipped config files regardless of build directory.

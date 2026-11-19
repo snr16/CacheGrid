@@ -17,6 +17,14 @@ SetResult LRUCache::set(const std::string& key, std::string value, std::optional
   if (new_cost > capacity_bytes_) return SetResult::TooLarge;
 
   const TimePoint now = now_();
+
+  // Reject a TTL so far in the future that `now + ttl` would overflow the
+  // clock's integer (undefined behaviour). Compared in milliseconds, because
+  // converting a huge ttl to the clock's nanoseconds would itself overflow.
+  if (ttl && ttl->count() > std::chrono::duration_cast<Millis>(TimePoint::max() - now).count()) {
+    return SetResult::InvalidTtl;
+  }
+
   auto it = map_.find(key);
 
   // An expired entry is logically absent: drop it first so it does not count
