@@ -41,7 +41,12 @@ struct NodeStats {
   bool ok = false;
 };
 
-// Reads eviction/memory counters from a node's INFO.
+// Reads eviction/memory/CPU counters from a server's INFO. Understands both
+// CacheGrid's field names and real Redis's (for the Redis baseline):
+//   CPU     used_cpu_seconds        | used_cpu_user + used_cpu_sys
+//   keys    keys                    | db0:keys=N,...
+//   memory  peak_rss_bytes          | used_memory_rss (current RSS; the
+//                                     benchmark never deletes, so ~ peak)
 NodeStats node_stats(const std::string& host_port, const LoadOptions& o) {
   NodeStats s;
   const auto colon = host_port.rfind(':');
@@ -51,6 +56,7 @@ NodeStats node_stats(const std::string& host_port, const LoadOptions& o) {
   std::string raw;
   resp::Value v;
   if (!c.call({"INFO"}, raw) || !resp::decode_reply(raw, v) || v.type != resp::Value::Type::Bulk) return s;
+  auto has = [&](const std::string& name) { return v.str.find("\n" + name + ":") != std::string::npos; };
   auto field = [&](const std::string& name) -> std::string {
     const auto p = v.str.find("\n" + name + ":");
     if (p == std::string::npos) return "0";
@@ -59,9 +65,17 @@ NodeStats node_stats(const std::string& host_port, const LoadOptions& o) {
   };
   s.evicted = std::stoull(field("evicted_keys"));
   s.used_memory = std::stoull(field("used_memory"));
-  s.keys = std::stoull(field("keys"));
-  s.peak_rss = std::stoull(field("peak_rss_bytes"));
-  s.cpu_seconds = std::stod(field("used_cpu_seconds"));
+  if (has("used_cpu_seconds")) {
+    s.keys = std::stoull(field("keys"));
+    s.peak_rss = std::stoull(field("peak_rss_bytes"));
+    s.cpu_seconds = std::stod(field("used_cpu_seconds"));
+  } else {  // Redis
+    const std::string db0 = field("db0");  // "keys=N,expires=...": stoull stops at ','
+    const std::string prefix = "keys=";
+    s.keys = db0.rfind(prefix, 0) == 0 ? std::stoull(db0.substr(prefix.size())) : 0;
+    s.peak_rss = std::stoull(field("used_memory_rss"));
+    s.cpu_seconds = std::stod(field("used_cpu_user")) + std::stod(field("used_cpu_sys"));
+  }
   s.ok = true;
   return s;
 }

@@ -49,7 +49,7 @@ docker compose --profile scale up -d node4
 # add node4@node4:7001 to proxy.nodes in config/docker/proxy.conf, then:
 docker compose kill -s HUP proxy
 ```
-Only the keys that now belong to node4 move (~1/4), and they're copied there automatically; see `benchmarks/results.md`.
+Only the keys that now belong to node4 move (~1/4), and they're copied there automatically; see `docs/architecture.md`.
 
 **Simulating failures:**
 ```bash
@@ -114,22 +114,26 @@ A file can start with `include <path>` and then override individual keys.
 
 ```bash
 benchmarks/fetch_trace.sh          # once: first 5M requests of a real Twitter cache trace (~214 MB)
+benchmarks/fetch_redis.sh          # once: build Redis from source for the baseline scenarios
 benchmarks/run_benchmarks.sh       # all scenarios; reports in benchmarks/raw/
 ./build/release/shard_contention config/bench.conf   # lock contention vs. shard count
 ./build/release/ring_analysis    config/bench.conf   # hash ring balance and key movement
 ```
 
-Highlights (single 8-core laptop; full results, setup and caveats in `benchmarks/results.md`):
+Highlights (single 8-core laptop; each run's full report is in `benchmarks/raw/`):
 
 | Measure | Result |
 |---|---|
 | GET p95 at 100 concurrent requests (proxy + 3 nodes, 2 copies/key) | **1.6 ms** |
-| Highest concurrency with GET p95 < 5 ms (proxy + 3 nodes) | **~300** |
+| Proxy + 3 nodes, 100 connections × 3 pipelined (300 in flight) | **137k–167k ops/s at 2.95–3.24 ms p95** |
+| Highest concurrency with GET p95 < 5 ms (proxy + 3 nodes) | **~200–300** (1 request per connection), **~400–600** (pipelined) |
 | Peak throughput through the proxy (50k concurrency) | **~0.9–1.0M ops/s** |
 | Peak throughput, single node direct | **1.7M ops/s** |
 | Real Twitter trace replay, hit rate with 3 × 64 MB caches | **74–88%** |
 | Errors while a node is killed (`kill -9`) and restarted under load | **0** |
 | Proxy optimization from profiling (10k–50k concurrency) | **+49–57% throughput, −21–28% p95** |
+
+Caveats: the load tester is closed-loop (it can under-report tail latency when the server stalls), everything shares one machine over loopback, and runs vary by up to ~20%.
 
 The trace replay uses the [Twitter cache-trace](https://github.com/twitter/cache-trace) dataset (cluster52), © Twitter, CC-BY 4.0.
 

@@ -26,6 +26,8 @@ cmake --build --preset release -j >/dev/null
 
 PIDS=()
 LAST_PID=
+# Log line that means "ready" (CacheGrid's; Redis prints a different one).
+READY="listening on"
 # start <name> <command...>: run in the background, wait until it's listening.
 start() {
   local log="$LOGS/$1.log"
@@ -34,7 +36,7 @@ start() {
   LAST_PID=$!
   PIDS+=("$LAST_PID")
   for _ in $(seq 1 100); do
-    grep -q "listening on" "$log" && return 0
+    grep -q "$READY" "$log" && return 0
     sleep 0.1
   done
   echo "failed to start: $*" >&2
@@ -59,6 +61,17 @@ nodes() {  # nodes <count>
     NODE2_PID=$LAST_PID
   fi
   if [ "$1" -ge 3 ]; then start node3 "$BIN/cachegrid-server" config/local/node3.conf; fi
+}
+
+# Real Redis as a baseline: redis <server config>
+redis() {
+  local bin
+  bin=$(conf bench.redis.server_binary config/bench.conf)
+  if [ ! -x "$bin" ]; then
+    echo "   skipped: $bin not found (run benchmarks/fetch_redis.sh first)"
+    return 1
+  fi
+  READY="Ready to accept connections" start redis "$bin" "$1"
 }
 
 bench() {  # bench <scenario>
@@ -106,11 +119,13 @@ run() {
       start proxy "$BIN/cachegrid-proxy" config/local/proxy-1node.conf
       bench proxy-1node
       ;;
-    proxy-3node | proxy-3node-zipf | proxy-3node-trace | proxy-3node-slo)
+    proxy-3node | proxy-3node-zipf | proxy-3node-trace | proxy-3node-slo | proxy-3node-pipelined)
       nodes 3
       start proxy "$BIN/cachegrid-proxy" config/proxy.conf
       bench "$1"
       ;;
+    redis-direct) if redis config/redis/redis.conf; then bench redis-direct; fi ;;
+    redis-io-threads) if redis config/redis/redis-io-threads.conf; then bench redis-io-threads; fi ;;
     failover)
       nodes 3
       start proxy "$BIN/cachegrid-proxy" config/proxy.conf
@@ -124,5 +139,7 @@ run() {
 if [ $# -gt 0 ]; then
   for s in "$@"; do run "$s"; done
 else
-  for s in node-direct proxy-1node proxy-3node proxy-3node-slo proxy-3node-zipf proxy-3node-trace failover; do run "$s"; done
+  for s in node-direct redis-direct redis-io-threads proxy-1node proxy-3node proxy-3node-slo proxy-3node-pipelined \
+    proxy-3node-zipf \
+    proxy-3node-trace failover; do run "$s"; done
 fi

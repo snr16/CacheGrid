@@ -9,7 +9,7 @@
 //
 // Closed loop: a connection sends its next request only when a reply comes
 // back. Simple and stable, but it hides some queueing delay when the server
-// stalls ("coordinated omission"): see docs and benchmarks/results.md.
+// stalls ("coordinated omission"): see docs/architecture.md.
 
 #include <cstddef>
 #include <cstdint>

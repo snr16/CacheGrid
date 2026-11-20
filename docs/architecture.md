@@ -93,7 +93,7 @@ See the Phase 5 section for the write path, failover and recovery sequence.
 
 **Resolved in Phase 5:** stale copies left on a key's old owner are now trimmed after every membership change, and new owners are filled from existing copies (no misses).
 
-**Measured** (`benchmarks/results.md`): adding a 4th node moved 23% of keys, all to the new node. `hash % N` would move 75%. Live cluster: 698 of 3,000 keys (23.3%) moved after adding node4.
+**Measured** (`benchmarks/ring_analysis.cpp`): adding a 4th node moved 23% of keys, all to the new node. `hash % N` would move 75%. Live cluster: 698 of 3,000 keys (23.3%) moved after adding node4.
 
 ## Phase 5 — Replication & failure recovery
 
@@ -119,17 +119,17 @@ health thread:  RUNID each node ─ fails×N ─► Down ─ answers again ─�
 
 **DBSIZE through the proxy** counts stored copies (keys × RF).
 
-**Measured on the live cluster:** see `benchmarks/results.md`. With node2 down: 3,000/3,000 reads and writes succeeded (Phase 4: 1,056 errors). After node2 recovered and node1 was stopped as well: 3,000/3,000 reads returned the newest value. Adding node4: 0 misses (Phase 4: 698), 6,000 copies (no stale copies left).
+**Measured on the live cluster:** With node2 down: 3,000/3,000 reads and writes succeeded (Phase 4: 1,056 errors). After node2 recovered and node1 was stopped as well: 3,000/3,000 reads returned the newest value. Adding node4: 0 misses (Phase 4: 698), 6,000 copies (no stale copies left).
 
 ## Phase 6 — Benchmarking & optimization
 
 **Load tester** (`cachegrid-bench`, engine in `src/LoadGenerator.cpp`):
-- N client threads, each with its own event loop over its share of connections. Every connection keeps exactly `depth` requests in flight (closed loop); **concurrency = connections × depth**.
+- N client threads, each with its own event loop over its share of connections. Every connection keeps exactly `depth` requests in flight (closed loop); **concurrency = connections × depth**. Caveat: a closed loop stops sending while the server stalls, so requests that would have queued during the stall are never measured and the tail looks better than real users would see ("coordinated omission"). An open-loop generator (fixed send rate, latency from the intended send time) would fix that.
 - Per-request latency = reply time − send time. Send times are queued per connection, since replies arrive in order. Latencies go into a log-linear histogram (`LatencyHistogram`, ~1.6% relative precision, O(1) record, merged across threads).
 - Only requests *sent* inside the measured window are counted, so warmup never leaks into results.
 - Workloads (`src/Workload.cpp`): uniform, Zipfian (YCSB/Gray algorithm), and trace replay (Twitter cache-trace CSV: get/gets → GET; set/add/replace/cas/append/prepend/incr/decr → SET at the recorded size and TTL; delete → DEL). Optional cache-aside refill (SET after a GET miss).
 - Server CPU and memory are read from each server's `INFO` (`used_cpu_seconds`, `peak_rss_bytes`, from `getrusage`) before and after every level.
 
-**Optimization (D14):** profiling showed the proxy spending about as much time in `malloc`/`free` (and waiting on the allocator's lock) as on socket I/O. The per-request path is now allocation-free apart from the request buffer: node connections are resolved once per membership change (`node_backend_`), owners come from `HashRing::owner_positions` into reused buffers, commands are compared case-insensitively without copying, and VSET/VDEL are encoded in place. Measured: +49–57% throughput and −21–28% p95 at 10k–50k concurrency (`benchmarks/results.md`).
+**Optimization (D14):** profiling showed the proxy spending about as much time in `malloc`/`free` (and waiting on the allocator's lock) as on socket I/O. The per-request path is now allocation-free apart from the request buffer: node connections are resolved once per membership change (`node_backend_`), owners come from `HashRing::owner_positions` into reused buffers, commands are compared case-insensitively without copying, and VSET/VDEL are encoded in place. Measured: +49–57% throughput and −21–28% p95 at 10k–50k concurrency (`benchmarks/raw/proxy-optimization-ab.md`).
 
-**Results summary:** p95 < 5 ms holds up to ~300 concurrent requests through the proxy (1.6 ms at 100); peak ~0.9–1.0M ops/s through the proxy and 1.7M ops/s on a node directly, on one 8-core laptop; 0 errors while a node is killed under load.
+**Results summary:** p95 < 5 ms holds up to ~200–300 concurrent requests through the proxy with one request per connection (1.6 ms at 100), and ~400–600 with pipelined clients (137k–167k ops/s at ~3 ms p95 with 300 in flight); peak ~0.9–1.0M ops/s through the proxy and 1.7M ops/s on a node directly, on one 8-core laptop; 0 errors while a node is killed under load.

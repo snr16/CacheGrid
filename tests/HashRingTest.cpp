@@ -77,7 +77,7 @@ TEST(HashRing, VirtualNodesBalanceLoad) {
   ASSERT_EQ(count.size(), 3u);
   // A node's share varies by roughly 1/sqrt(vnodes), hence a tolerance
   // (test.ring.balance_tolerance_percent). With 1 vnode per node the spread
-  // is far worse (next test, and benchmarks/results.md).
+  // is far worse (next test, and benchmarks/ring_analysis.cpp).
   const double ideal = kKeys / 3.0;
   for (const auto& [id, c] : count) {
     EXPECT_NEAR(c, ideal, ideal * kBalanceTol) << id << " is too far off an even share";
