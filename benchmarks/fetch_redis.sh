@@ -17,7 +17,9 @@ mkdir -p "$dir/src" "$(dirname "$bin")"
 echo "downloading $url"
 curl -fsSL "$url" | tar -xz -C "$dir/src" --strip-components 1
 echo "building redis-server (a minute or two)..."
-make -C "$dir/src" -j"$(getconf _NPROCESSORS_ONLN)" >"$dir/build.log" 2>&1 \
+# Build inside src/: only the core server. The top-level make also builds
+# optional modules (search, JSON, ...) that need extra tools and aren't used.
+make -C "$dir/src/src" -j"$(getconf _NPROCESSORS_ONLN)" redis-server >"$dir/build.log" 2>&1 \
   || { tail -30 "$dir/build.log"; exit 1; }
 cp "$dir/src/src/redis-server" "$bin"
 echo "done: $("$bin" --version)"
